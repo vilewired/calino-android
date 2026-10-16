@@ -1,14 +1,17 @@
 package calino.malinov.ski.ui.surfaces
 
+import calino.malinov.ski.ui.components.LocalRowDragLock
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalDensity
-import calino.malinov.ski.state.TaskInsertEdge
 import calino.malinov.ski.state.TaskReorderPlan
-import calino.malinov.ski.state.TaskTree
-import calino.malinov.ski.state.planDropReorder
+import calino.malinov.ski.state.isReorderable
+import calino.malinov.ski.ui.components.rowReorderPreview
 import calino.malinov.ski.R
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.res.pluralStringResource
@@ -350,40 +353,50 @@ fun AgendaScreen(
                 }
             }
         }
-        HorizontalPager(
-            state = pagerState,
-            modifier = Modifier.fillMaxSize(),
-            beyondViewportPageCount = 1,
-            key = { it },
-        ) { page ->
-            AgendaMonthPage(
-                month = monthForPage(page),
-                selected = selected,
-                startRequest = positionRequest,
-                onFocusedDayPreview = { day -> pageFocus[page] = day },
-                // A page that has left the pager's reach loses its list, and
-                // with it the position this was recording. Left behind, the
-                // entry would name a day the page no longer opens on.
-                onDisposed = { pageFocus.remove(page) },
-                reportsFocusedDate = focusReportingEnabled && page == pagerState.settledPage && !pagerState.isScrollInProgress,
-                onFocusedDateChanged = { day ->
-                    if (day.toEpochDay() != currentSelectedEpoch.value) {
-                        selectedEpoch = day.toEpochDay()
-                        onDateChanged(day)
-                    }
-                },
-                events = events,
-                tasks = tasks,
-                onEventClick = onEventClick,
-                onEventAction = onEventAction,
-                onEventDrop = onEventDrop,
-                onTaskClick = onTaskClick,
-                onTaskAction = onTaskAction,
-                onTaskDrop = onTaskDrop,
-                onTaskReorder = onTaskReorder,
-                onTaskDone = onTaskDone,
-                onAddOn = onAddOn,
-            )
+        // A lifted task row owns the pointer: the page must not turn under it.
+        var rowDragging by remember { mutableStateOf(false) }
+        // Pass the lock on, so a gesture further out (the calendar zoom) holds still too.
+        val outerRowDragLock = LocalRowDragLock.current
+        val rowDragLock = remember(outerRowDragLock) {
+            { dragging: Boolean -> rowDragging = dragging; outerRowDragLock(dragging) }
+        }
+        CompositionLocalProvider(LocalRowDragLock provides rowDragLock) {
+            HorizontalPager(
+                state = pagerState,
+                modifier = Modifier.fillMaxSize(),
+                beyondViewportPageCount = 1,
+                key = { it },
+                userScrollEnabled = !rowDragging,
+            ) { page ->
+                AgendaMonthPage(
+                    month = monthForPage(page),
+                    selected = selected,
+                    startRequest = positionRequest,
+                    onFocusedDayPreview = { day -> pageFocus[page] = day },
+                    // A page that has left the pager's reach loses its list, and
+                    // with it the position this was recording. Left behind, the
+                    // entry would name a day the page no longer opens on.
+                    onDisposed = { pageFocus.remove(page) },
+                    reportsFocusedDate = focusReportingEnabled && page == pagerState.settledPage && !pagerState.isScrollInProgress,
+                    onFocusedDateChanged = { day ->
+                        if (day.toEpochDay() != currentSelectedEpoch.value) {
+                            selectedEpoch = day.toEpochDay()
+                            onDateChanged(day)
+                        }
+                    },
+                    events = events,
+                    tasks = tasks,
+                    onEventClick = onEventClick,
+                    onEventAction = onEventAction,
+                    onEventDrop = onEventDrop,
+                    onTaskClick = onTaskClick,
+                    onTaskAction = onTaskAction,
+                    onTaskDrop = onTaskDrop,
+                    onTaskReorder = onTaskReorder,
+                    onTaskDone = onTaskDone,
+                    onAddOn = onAddOn,
+                )
+            }
         }
             }
         }
@@ -540,12 +553,6 @@ private const val AgendaFocusLineFromTop = .30f
  * the empty line. Shared by the month-paged agenda and by the landscape day
  * pane so the two cannot drift apart.
  */
-/** Share of a task row's height, at its top and bottom, that reads as "between rows" during a drag. */
-private const val AgendaReorderEdge = .25f
-
-/** What releasing a dragged agenda task would do; [plan] is set for a valid reorder. */
-private data class AgendaDropHit(val target: CalTask, val edge: TaskInsertEdge?, val plan: TaskReorderPlan?)
-
 @Composable
 internal fun AgendaDayBlock(
     day: LocalDate,
@@ -603,44 +610,33 @@ internal fun AgendaDayBlock(
                 val taskLookup = LocalTaskLookup.current
                 val listRows = nestWithinList(tasks, taskLookup)
                 val rowTasks = remember(listRows) { listRows.filterIsInstance<TaskListRow.Item>().map { it.task } }
-                val dayTree = remember(tasks) { TaskTree(tasks) }
-                // Where each task row is, read only while a drag recomposes.
+                val rowDepth = remember(listRows) {
+                    listRows.filterIsInstance<TaskListRow.Item>().associate { it.task.id to it.depth }
+                }
+                // Where each task row is at rest, read only while a drag recomposes.
                 val rowBounds = remember { mutableMapOf<String, Rect>() }
                 var draggingTaskId by remember { mutableStateOf<String?>(null) }
                 var dragY by remember { mutableFloatStateOf(0f) }
+                val rowGapPx = with(LocalDensity.current) { 6.dp.toPx() }
                 val gapSnapPx = with(LocalDensity.current) { 8.dp.toPx() }
-                // The dragged card's centre against the day's other task rows:
-                // the top or bottom quarter of one reorders (when valid); any
-                // other spot among them means "stay in this day".
-                val dropHit = remember(draggingTaskId, dragY, rowTasks) {
-                    // A host that does not handle reorders keeps the old drag.
+                // While a task is held, the tasks it can trade places with (its
+                // day's open, untimed siblings) slide apart to open a gap where
+                // it would land; releasing drops it into that gap.
+                val reorder = remember(draggingTaskId, dragY, rowTasks) {
                     if (onTaskReorder == null) return@remember null
                     val dragged = rowTasks.firstOrNull { it.id == draggingTaskId } ?: return@remember null
                     val source = rowBounds[dragged.id] ?: return@remember null
-                    val center = source.center.y + dragY
-                    val (target, bounds) = rowTasks.asSequence()
-                        .filter { it.id != dragged.id }
-                        .mapNotNull { target -> rowBounds[target.id]?.let { target to it } }
-                        .map { (target, bounds) ->
-                            val distance = when {
-                                center < bounds.top -> bounds.top - center
-                                center > bounds.bottom -> center - bounds.bottom
-                                else -> 0f
-                            }
-                            Triple(target, bounds, distance)
-                        }
-                        .filter { it.third <= gapSnapPx }
-                        .minByOrNull { it.third }
-                        ?.let { it.first to it.second }
-                        ?: return@remember null
-                    val edge = when {
-                        center < bounds.top + bounds.height * AgendaReorderEdge -> TaskInsertEdge.Before
-                        center > bounds.bottom - bounds.height * AgendaReorderEdge -> TaskInsertEdge.After
-                        else -> null
-                    }
-                    AgendaDropHit(target, edge, edge?.let { planDropReorder(rowTasks, dragged, target.id, it, dayTree) })
+                    if (!dragged.isReorderable()) return@remember null
+                    rowReorderPreview(
+                        rowTasks = rowTasks,
+                        rowDepth = rowDepth,
+                        rowBounds = rowBounds,
+                        dragged = dragged,
+                        draggedCenter = source.center.y + dragY,
+                        slot = source.height + rowGapPx,
+                        snap = gapSnapPx,
+                    )
                 }
-                val insertTarget = dropHit?.takeIf { it.plan != null }?.let { it.target.id to it.edge }
                 listRows.forEach { row ->
                     when (row) {
                         is TaskListRow.AbsentParent -> AbsentParentRow(
@@ -651,7 +647,18 @@ internal fun AgendaDayBlock(
                         is TaskListRow.Item -> {
                             val (task, depth, nestingLines) = row
                             var menuOpen by remember(task.id) { mutableStateOf(false) }
-                            Box(Modifier.onGloballyPositioned { rowBounds[task.id] = it.boundsInRoot() }) {
+                            val shift by animateFloatAsState(
+                                targetValue = reorder?.shifts?.get(task.id) ?: 0f,
+                                animationSpec = tween(140),
+                                label = "agenda reorder gap",
+                            )
+                            Box(
+                                Modifier
+                                    // Measured before the shift, so the gap logic
+                                    // always works from where rows sit at rest.
+                                    .onGloballyPositioned { rowBounds[task.id] = it.boundsInRoot() }
+                                    .graphicsLayer { translationY = shift },
+                            ) {
                                 AgendaTaskRow(
                                     task = task,
                                     // The rail has to cross this column's 6dp
@@ -669,15 +676,17 @@ internal fun AgendaDayBlock(
                                     onClick = onTaskClick?.let { click -> { click(task) } },
                                     onCheckedChange = { done -> onTaskDone(task, done) },
                                     onLongClick = { menuOpen = true },
+                                    // A hold that turns into a drag is a move, not a
+                                    // request for the menu the hold opened.
+                                    onDragStart = { menuOpen = false },
                                     onDragMove = { distance -> draggingTaskId = task.id; dragY = distance },
                                     onDragEnd = { offset ->
-                                        val hit = dropHit
+                                        val preview = reorder
                                         when {
-                                            hit?.plan != null -> onTaskReorder?.invoke(hit.plan)
-                                            // Released among this day's tasks without a
-                                            // valid spot: it springs back rather than
-                                            // jumping to a neighbouring day.
-                                            hit != null -> Unit
+                                            preview?.plan != null -> onTaskReorder?.invoke(preview.plan)
+                                            // Released among this day's tasks: it settles
+                                            // back rather than jumping to another day.
+                                            preview?.inDay == true -> Unit
                                             kotlin.math.abs(offset.y) > 36f ->
                                                 onTaskDrop(task, day.plusDays((offset.y / 76f).roundToInt().toLong()))
                                         }
@@ -685,7 +694,6 @@ internal fun AgendaDayBlock(
                                         dragY = 0f
                                     },
                                     onDragCancel = { draggingTaskId = null; dragY = 0f },
-                                    insertEdge = insertTarget?.takeIf { it.first == task.id }?.second,
                                 )
                                 TaskActionMenu(
                                     task = task,
@@ -727,44 +735,53 @@ fun DayPane(
     onAdd: (LocalDate) -> Unit = {},
 ) {
     val daySidebarLabel = stringResource(R.string.cal_day_sidebar)
-    HorizontalPager(
-        state = state,
-        modifier = modifier
-            .fillMaxSize()
-            .background(CalinoColors.Canvas)
-            .testTag("day-pane-pager")
-            .semantics { contentDescription = daySidebarLabel },
-        userScrollEnabled = interactionEnabled,
-        beyondViewportPageCount = 1,
-        key = { page -> dateForDayPage(page).toEpochDay() },
-    ) { page ->
-        val pageDay = dateForDayPage(page)
-        val agendaDayFormatter = localizedDateFormatter("MMM d, yyyy")
-        val dayPageDescription = stringResource(R.string.cal_day_sidebar_page, pageDay.format(agendaDayFormatter))
-        val pageEvents = remember(eventDateIndex, pageDay) { eventDateIndex.eventsOn(pageDay) }
-        val pageTasks = tasksByDueDate[pageDay].orEmpty()
-        Column(
-            Modifier
+    // A lifted task row owns the pointer: the page must not turn under it.
+    var rowDragging by remember { mutableStateOf(false) }
+    // Pass the lock on, so a gesture further out (the calendar zoom) holds still too.
+    val outerRowDragLock = LocalRowDragLock.current
+    val rowDragLock = remember(outerRowDragLock) {
+        { dragging: Boolean -> rowDragging = dragging; outerRowDragLock(dragging) }
+    }
+    CompositionLocalProvider(LocalRowDragLock provides rowDragLock) {
+        HorizontalPager(
+            state = state,
+            modifier = modifier
                 .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .padding(start = 16.dp, end = 16.dp, top = 8.dp)
-                .padding(bottom = CalinoSpacing.PillClearance)
-                .semantics { contentDescription = dayPageDescription },
-        ) {
-            AgendaDayBlock(
-                day = pageDay,
-                events = pageEvents,
-                tasks = pageTasks,
-                onEventClick = onEventClick,
-                onEventAction = onEventAction,
-                onEventDrop = onEventDrop,
-                onTaskClick = onTaskClick,
-                onTaskAction = onTaskAction,
-                onTaskDrop = onTaskDrop,
-                onTaskReorder = onTaskReorder,
-                onTaskDone = onTaskDone,
-                onAdd = { onAdd(pageDay) },
-            )
+                .background(CalinoColors.Canvas)
+                .testTag("day-pane-pager")
+                .semantics { contentDescription = daySidebarLabel },
+            userScrollEnabled = (interactionEnabled) && !rowDragging,
+            beyondViewportPageCount = 1,
+            key = { page -> dateForDayPage(page).toEpochDay() },
+        ) { page ->
+            val pageDay = dateForDayPage(page)
+            val agendaDayFormatter = localizedDateFormatter("MMM d, yyyy")
+            val dayPageDescription = stringResource(R.string.cal_day_sidebar_page, pageDay.format(agendaDayFormatter))
+            val pageEvents = remember(eventDateIndex, pageDay) { eventDateIndex.eventsOn(pageDay) }
+            val pageTasks = tasksByDueDate[pageDay].orEmpty()
+            Column(
+                Modifier
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(start = 16.dp, end = 16.dp, top = 8.dp)
+                    .padding(bottom = CalinoSpacing.PillClearance)
+                    .semantics { contentDescription = dayPageDescription },
+            ) {
+                AgendaDayBlock(
+                    day = pageDay,
+                    events = pageEvents,
+                    tasks = pageTasks,
+                    onEventClick = onEventClick,
+                    onEventAction = onEventAction,
+                    onEventDrop = onEventDrop,
+                    onTaskClick = onTaskClick,
+                    onTaskAction = onTaskAction,
+                    onTaskDrop = onTaskDrop,
+                    onTaskReorder = onTaskReorder,
+                    onTaskDone = onTaskDone,
+                    onAdd = { onAdd(pageDay) },
+                )
+            }
         }
     }
 }

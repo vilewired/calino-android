@@ -3690,6 +3690,9 @@ private fun CalinoAppContent(pocViewModel: PocRepositoryViewModel) {
                 }
                 handleTaskAction(action, task)
             },
+            onTaskReorder = { plan ->
+                launchWrite({ repository.applyTaskReorder(plan) }, indicate = PillWriteKind.Save)
+            },
             updateAvailable = appUpdateState.available != null,
             onUpdateClick = {
                 sidebarVisible = false

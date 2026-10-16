@@ -1,5 +1,6 @@
 package calino.malinov.ski.ui.home
 
+import calino.malinov.ski.ui.components.LocalRowDragLock
 import android.os.Build
 import androidx.activity.compose.PredictiveBackHandler
 import androidx.compose.animation.AnimatedContent
@@ -1774,6 +1775,15 @@ fun HomeScreen(
              */
             val edgeDrag by rememberUpdatedState(onEdgeDrag)
             val edgeRelease by rememberUpdatedState(onEdgeRelease)
+            // Set while a task or event row below is lifted: that vertical drag
+            // moves the row, so the zoom must not claim it -- not even on the
+            // day list, where a list that cannot scroll would otherwise hand
+            // every vertical drag to the zoom.
+            var rowDragActive by remember { mutableStateOf(false) }
+            val outerRowDragLock = LocalRowDragLock.current
+            val zoomRowDragLock = remember(outerRowDragLock) {
+                { dragging: Boolean -> rowDragActive = dragging; outerRowDragLock(dragging) }
+            }
             var gestureCoordinates by remember { mutableStateOf<LayoutCoordinates?>(null) }
             val calendarZoomGesture = Modifier.pointerInput(handleHeight, calendarEdgeSwipes) {
                 awaitEachGesture {
@@ -1876,6 +1886,7 @@ fun HomeScreen(
                                     abs(travel.y) > viewConfiguration.touchSlop * 1.5f &&
                                     abs(travel.y) > abs(travel.x) * 3f
                                 ) {
+                                    if (rowDragActive) break
                                     // A held event chip consumes position changes
                                     // before this Final-pass observer. Preserve its
                                     // drag, but do not reject the whole month grid:
@@ -1933,362 +1944,364 @@ fun HomeScreen(
                 }
             }
             val laneOverlap = compactLaneOverlap(handleHeight)
-            Box(
-                Modifier.fillMaxSize()
-                    .clipToBounds()
-                    .onGloballyPositioned { gestureCoordinates = it }
-                    .testTag("calendar-zoom-surface")
-                    .then(if (interactionEnabled) calendarZoomGesture else Modifier)
-                    .drawWithContent {
-                        // Roll the strip and day list beneath the fixed month
-                        // heading. Drawing moves; the pointer owner stays put.
-                        val stripTravel = 80.dp.toPx() * liveAgendaEdgeProgress()
-                        withTransform({ translate(top = -stripTravel) }) {
-                            this@drawWithContent.drawContent()
-                        }
-                    },
-            ) {
-                // The week pager is the compact endpoint of the same
-                // selected-week geometry drawn by StaticMonthGrid. Keeping it
-                // underneath the morphing canvas lets the canvas take over
-                // at the exact shared row instead of painting a separate
-                // week surface on top of a fading month.
-                // While the week pager owns the compact lane it is the only
-                // surface allowed to draw that row: the month canvas hides
-                // its own copy instead of the strip painting an opaque
-                // backing over it. An opaque backing was what made the lane
-                // lose its translucency over the rail mid-swipe.
-                val weekPreviewActive = remember(weekPagerState, weekStripDay, weekStart) {
-                    derivedStateOf {
-                        weekPagerState.isScrollInProgress ||
-                            abs(weekPagerState.currentPageOffsetFraction) > .001f ||
-                            weekPageFor(weekStripDay, weekStart) != weekPagerState.settledPage
-                    }
-                }
-                // Both of these are booleans that flip twice in a whole drag,
-                // but reading the zoom float in composition made every sample
-                // of that drag recompose the calendar, the month pager's three
-                // page trees and the day surface underneath them.
-                val weekStripMounted by remember(zoomState) {
-                    derivedStateOf { zoomState.value < MonthEndpointBlendEnd }
-                }
-                val monthPagerScrollable by remember(zoomState) {
-                    derivedStateOf { zoomState.value >= MonthEndpointBlendEnd }
-                }
-                if (weekStripMounted) {
-                        WeekStrip(
-                        state = weekPagerState,
-                        day = selected,
-                        displayedWeekDay = weekStripDay,
-                        weekStart = weekStart,
-                        events = events,
-                        eventDateIndex = eventDateIndex,
-                        tasksByDueDate = tasksByDueDate,
-                        gestureModifier = Modifier,
-                        interactionEnabled = interactionEnabled,
-                            onUserSwipeStart = {
-                                weekAgendaHandoffDay = null
-                                weekRollbackJob?.cancel()
-                                weekRollbackJob = null
-                                weekUserGestureActive = true
-                                compactBoundaryDay?.let { boundary ->
-                                    // Prevent the day-boundary observer from
-                                    // recreating this preview while the real
-                                    // week pager gesture owns the strip.
-                                    blockedBoundaryDay = boundary
-                                    compactBoundaryDay = null
-                                }
-                                weekPreviewGeneration += 1
-                                // A human horizontal gesture takes ownership
-                                // from any boundary preview. Without this
-                                // invalidation, a quick swipe to the same page as
-                                // a cancelled synthetic preview could be mistaken
-                                // for that preview's settle.
-                                suppressedWeekPreview = null
-                            },
-                        modifier = Modifier
-                            .zIndex(5f)
-                            .fillMaxWidth()
-                            .requiredHeight(CompactWeekMetrics.Height)
-                            .drawWithContent {
-                                // The month Canvas owns the idle endpoint.
-                                // During a horizontal preview this layer
-                                // becomes the sole owner of the compact lane,
-                                // and the month row underneath goes away on
-                                // its own, so nothing has to be painted over
-                                // it. Keeping the lane unpainted is what lets
-                                // the rail keep showing through the strip.
-                                if (weekPreviewActive.value) {
-                                    drawContent()
-                                }
-                            },
-                        onDay = { date ->
-                            if (interactionEnabled) {
-                                selectedEpoch = date.toEpochDay()
-                                onDateChanged(date)
-                            }
-                        },
-                    )
-                }
+            CompositionLocalProvider(LocalRowDragLock provides zoomRowDragLock) {
                 Box(
-                    Modifier.fillMaxWidth()
-                        // Above the rail, so the compact row keeps its own
-                        // contrast where the two overlap. The rail's glass
-                        // lane is a backdrop for the strip, not a veil over
-                        // it: drawn on top, it left the dates reading through
-                        // a tint whose legibility depended on whichever event
-                        // happened to be blurred underneath. The grid below
-                        // the lane cannot cover the rail in turn because it is
-                        // clipped to the calendar's visible height.
-                        .zIndex(4f)
-                        // The grid stays measured at its full height so the
-                        // zoom drag never remeasures it, but the lane it
-                        // *occupies* has to end where it is visible: the rail
-                        // sits under this layer, and a full-height touch
-                        // box would hand every scroll on the day list to the
-                        // calendar's zoom gesture instead.
+                    Modifier.fillMaxSize()
                         .clipToBounds()
-                        .layout { measurable, constraints ->
-                            val placeable = measurable.measure(constraints)
-                            val visible = calendarHeight.value.roundToPx().coerceIn(0, placeable.height)
-                            layout(placeable.width, visible) { placeable.place(0, 0) }
-                        }
-                        .requiredHeight(detailedGridHeight)
+                        .onGloballyPositioned { gestureCoordinates = it }
+                        .testTag("calendar-zoom-surface")
+                        .then(if (interactionEnabled) calendarZoomGesture else Modifier)
                         .drawWithContent {
-                            val visibleHeight = calendarHeight.value.toPx().coerceIn(0f, size.height)
-                            clipRect(bottom = visibleHeight) {
+                            // Roll the strip and day list beneath the fixed month
+                            // heading. Drawing moves; the pointer owner stays put.
+                            val stripTravel = 80.dp.toPx() * liveAgendaEdgeProgress()
+                            withTransform({ translate(top = -stripTravel) }) {
                                 this@drawWithContent.drawContent()
                             }
                         },
                 ) {
-                    MonthPager(
-                        state = monthPagerState,
-                        selected = selected,
-                        weekStart = weekStart,
-                        events = events,
-                        eventDateIndex = eventDateIndex,
-                        journals = journals,
-                        tasksByDueDate = tasksByDueDate,
-                        zoomState = currentZoom,
-                        compactGridHeight = splitGridHeight,
-                        detailedGridHeight = detailedGridHeight,
-                        // The day rail is intentionally pulled upward behind
-                        // the handle. The visible month ends where that rail
-                        // begins, not at the full measured month layer.
-                        // Deferred: this tracks the zoom, and reading it here
-                        // recomposed the month pager, all three of its page
-                        // trees and their 42 hit nodes on every drag sample.
-                        // Its only consumer is a drop, which reads it then.
-                        visibleGridHeight = {
-                            (calendarHeight.value + handleHeight - laneOverlap)
-                                .coerceAtLeast(0.dp)
-                        },
-                        compactDay = weekStripDay,
-                        compactSelectorIndex = { compactSelectorIndex.value },
-                        compactDayPagerTravel = {
-                            dayPagerTravel.value.takeIf { abs(it) > .001f }
-                        },
-                        monthSelectorCrossing = {
-                            monthCrossingEnds?.let { (from, to) ->
-                                MonthSelectorCrossing(from, to, monthCrossingProgress.value)
-                            }
-                        },
-                        compactBoundaryTransition = isDayPagerBoundaryTransition,
-                        compactLaneOwnedByWeek = weekPreviewActive,
-                        modifier = Modifier.fillMaxSize(),
-                        gestureModifier = Modifier,
-                        // At the compact endpoint the week pager is the sole
-                        // horizontal owner. Disable the month pager as soon
-                        // as the visual morph reaches its handoff threshold,
-                        // including while a reverse zoom settle is still in
-                        // flight.
-                        userScrollEnabled = interactionEnabled && monthPagerScrollable,
-                        onDay = { date ->
-                            if (interactionEnabled) {
-                                // The split level is a selection surface. Only
-                                // the detailed settled level opens the day modal.
-                                val isDetailed = zoomState.floatValue >= 1.5f
-                                selectedEpoch = date.toEpochDay()
-                                onDateChanged(date)
-                                if (isDetailed) onDayClick?.invoke(date)
-                            }
-                        },
-                        onEventClick = onEventClick,
-                        onEventAction = onEventAction,
-                    )
-                }
-                // The handle stays attached to the shared surface, so it
-                // travels with the month-to-week morph as one gesture
-                // affordance. Turned off, it gives its band back to the day
-                // surface and the vertical drag on the grid remains the way to
-                // change zoom.
-                if (showZoomHandle) {
+                    // The week pager is the compact endpoint of the same
+                    // selected-week geometry drawn by StaticMonthGrid. Keeping it
+                    // underneath the morphing canvas lets the canvas take over
+                    // at the exact shared row instead of painting a separate
+                    // week surface on top of a fading month.
+                    // While the week pager owns the compact lane it is the only
+                    // surface allowed to draw that row: the month canvas hides
+                    // its own copy instead of the strip painting an opaque
+                    // backing over it. An opaque backing was what made the lane
+                    // lose its translucency over the rail mid-swipe.
+                    val weekPreviewActive = remember(weekPagerState, weekStripDay, weekStart) {
+                        derivedStateOf {
+                            weekPagerState.isScrollInProgress ||
+                                abs(weekPagerState.currentPageOffsetFraction) > .001f ||
+                                weekPageFor(weekStripDay, weekStart) != weekPagerState.settledPage
+                        }
+                    }
+                    // Both of these are booleans that flip twice in a whole drag,
+                    // but reading the zoom float in composition made every sample
+                    // of that drag recompose the calendar, the month pager's three
+                    // page trees and the day surface underneath them.
+                    val weekStripMounted by remember(zoomState) {
+                        derivedStateOf { zoomState.value < MonthEndpointBlendEnd }
+                    }
+                    val monthPagerScrollable by remember(zoomState) {
+                        derivedStateOf { zoomState.value >= MonthEndpointBlendEnd }
+                    }
+                    if (weekStripMounted) {
+                            WeekStrip(
+                            state = weekPagerState,
+                            day = selected,
+                            displayedWeekDay = weekStripDay,
+                            weekStart = weekStart,
+                            events = events,
+                            eventDateIndex = eventDateIndex,
+                            tasksByDueDate = tasksByDueDate,
+                            gestureModifier = Modifier,
+                            interactionEnabled = interactionEnabled,
+                                onUserSwipeStart = {
+                                    weekAgendaHandoffDay = null
+                                    weekRollbackJob?.cancel()
+                                    weekRollbackJob = null
+                                    weekUserGestureActive = true
+                                    compactBoundaryDay?.let { boundary ->
+                                        // Prevent the day-boundary observer from
+                                        // recreating this preview while the real
+                                        // week pager gesture owns the strip.
+                                        blockedBoundaryDay = boundary
+                                        compactBoundaryDay = null
+                                    }
+                                    weekPreviewGeneration += 1
+                                    // A human horizontal gesture takes ownership
+                                    // from any boundary preview. Without this
+                                    // invalidation, a quick swipe to the same page as
+                                    // a cancelled synthetic preview could be mistaken
+                                    // for that preview's settle.
+                                    suppressedWeekPreview = null
+                                },
+                            modifier = Modifier
+                                .zIndex(5f)
+                                .fillMaxWidth()
+                                .requiredHeight(CompactWeekMetrics.Height)
+                                .drawWithContent {
+                                    // The month Canvas owns the idle endpoint.
+                                    // During a horizontal preview this layer
+                                    // becomes the sole owner of the compact lane,
+                                    // and the month row underneath goes away on
+                                    // its own, so nothing has to be painted over
+                                    // it. Keeping the lane unpainted is what lets
+                                    // the rail keep showing through the strip.
+                                    if (weekPreviewActive.value) {
+                                        drawContent()
+                                    }
+                                },
+                            onDay = { date ->
+                                if (interactionEnabled) {
+                                    selectedEpoch = date.toEpochDay()
+                                    onDateChanged(date)
+                                }
+                            },
+                        )
+                    }
                     Box(
                         Modifier.fillMaxWidth()
-                            .requiredHeight(handleHeight)
-                            .zIndex(6f)
-                            .offset {
-                                IntOffset(0, with(density) { calendarHeight.value.roundToPx() })
-                            },
-                        // The bar occupies a half-height band but keeps a full
-                        // touch lane, which overflows this box evenly.
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        ZoomHandle(
-                            zoomLevel = zoomLevel,
-                            zoomBand = zoomBand,
-                            gestureModifier = Modifier,
-                            onTap = {
-                                val level = zoomState.floatValue.roundToInt().coerceIn(0, 2)
-                                animateZoomTo(if (level < 2) level + 1f else 1f)
-                            },
-                        )
-                    }
-                }
-
-                // The rail runs up behind the handle and the compact strip
-                // instead of starting below them, so hours slide under a
-                // translucent lane rather than stopping at a hard edge. The
-                // overlap only changes with the pull-bar setting, so this
-                // never remeasures during a zoom drag; the lane's own scrim is
-                // what hides the rail again once the month grid owns that
-                // space.
-                Box(
-                    Modifier.fillMaxWidth()
-                    // Keep the rail above the month surface where the two
-                    // surfaces overlap. The handle is explicitly above this
-                    // layer, so its compact tap lane cannot be swallowed by
-                    // the rail's large scroll container.
-                    .zIndex(2f)
-                        .requiredHeight(daySurfaceHeight + laneOverlap)
-                        .offset {
-                            IntOffset(
-                                0,
-                                with(density) {
-                                    (calendarHeight.value + handleHeight - laneOverlap).roundToPx()
-                                },
-                            )
-                        }
-                        .clipToBounds(),
-                ) {
-                    val selectedMonthPage = monthPageFor(YearMonth.from(selected))
-                    val monthPreviewPage by remember(monthPagerState, selectedMonthPage) {
-                        derivedStateOf {
-                            val distance = monthPagerState.getOffsetDistanceInPages(selectedMonthPage)
-                            when {
-                                distance < -.001f -> selectedMonthPage + 1
-                                distance > .001f -> selectedMonthPage - 1
-                                else -> selectedMonthPage
-                            }.coerceIn(0, MonthPagerPageCount - 1)
-                        }
-                    }
-                    val monthAgendaPreview = headingUsesMonthPager && agendaOwnsInputNow &&
-                        monthPagerState.isScrollInProgress && isUserSettle(monthPagerState) &&
-                        monthPreviewPage != selectedMonthPage
-                    val selectedWeekPage = weekPageFor(selected, weekStart)
-                    val weekPreviewPage by remember(weekPagerState, selectedWeekPage) {
-                        derivedStateOf {
-                            val distance = weekPagerState.getOffsetDistanceInPages(selectedWeekPage)
-                            when {
-                                distance < -.001f -> selectedWeekPage + 1
-                                distance > .001f -> selectedWeekPage - 1
-                                else -> selectedWeekPage
-                            }.coerceIn(0, WeekPagerPageCount - 1)
-                        }
-                    }
-                    val liveWeekAgendaPreview = !headingUsesMonthPager && agendaOwnsInputNow &&
-                        isUserSettle(weekPagerState) && weekPreviewPage != selectedWeekPage
-                    val weekAgendaPreviewDay = when {
-                        liveWeekAgendaPreview -> weekStartForPage(weekPreviewPage, weekStart)
-                            .plusDays(selected.weekdayColumn(weekStart).toLong())
-                        weekAgendaHandoffDay != null -> weekAgendaHandoffDay
-                        else -> null
-                    }
-                    val weekAgendaPreview = !headingUsesMonthPager && agendaOwnsInputNow &&
-                        weekAgendaPreviewDay != null
-                    DayPagerSurface(
-                        state = dayPagerState,
-                        events = events,
-                        eventDateIndex = eventDateIndex,
-                        tasksByDueDate = tasksByDueDate,
-                        modifier = Modifier.fillMaxSize().graphicsLayer {
-                            translationX = when {
-                                monthAgendaPreview -> monthPagerState
-                                    .getOffsetDistanceInPages(selectedMonthPage) * size.width
-                                liveWeekAgendaPreview -> weekPagerState
-                                    .getOffsetDistanceInPages(selectedWeekPage) * size.width
-                                else -> 0f
+                            // Above the rail, so the compact row keeps its own
+                            // contrast where the two overlap. The rail's glass
+                            // lane is a backdrop for the strip, not a veil over
+                            // it: drawn on top, it left the dates reading through
+                            // a tint whose legibility depended on whichever event
+                            // happened to be blurred underneath. The grid below
+                            // the lane cannot cover the rail in turn because it is
+                            // clipped to the calendar's visible height.
+                            .zIndex(4f)
+                            // The grid stays measured at its full height so the
+                            // zoom drag never remeasures it, but the lane it
+                            // *occupies* has to end where it is visible: the rail
+                            // sits under this layer, and a full-height touch
+                            // box would hand every scroll on the day list to the
+                            // calendar's zoom gesture instead.
+                            .clipToBounds()
+                            .layout { measurable, constraints ->
+                                val placeable = measurable.measure(constraints)
+                                val visible = calendarHeight.value.roundToPx().coerceIn(0, placeable.height)
+                                layout(placeable.width, visible) { placeable.place(0, 0) }
                             }
-                        },
-                        interactionEnabled = interactionEnabled,
-                        zoomState = currentZoom,
-                        laneOverlap = laneOverlap,
-                        agendaOwnsInput = agendaOwnsInputNow,
-                        agendaScroll = agendaScroll,
-                        onEvent = onEventClick,
-                        onEventAction = onEventAction,
-                        onEventDrop = onEventDrop,
-                        onTaskDone = onTaskDone,
-                        onTaskClick = onTaskClick,
-                        onTaskAction = onTaskAction,
-                        onTaskDrop = onTaskDrop,
-                        onOpenDay = splitOpenDay,
-                    )
-                    if (monthAgendaPreview) {
-                        val previewMonth = monthForPage(monthPreviewPage)
-                        val previewDay = previewMonth.atDay(
-                            selected.dayOfMonth.coerceAtMost(previewMonth.lengthOfMonth()),
+                            .requiredHeight(detailedGridHeight)
+                            .drawWithContent {
+                                val visibleHeight = calendarHeight.value.toPx().coerceIn(0f, size.height)
+                                clipRect(bottom = visibleHeight) {
+                                    this@drawWithContent.drawContent()
+                                }
+                            },
+                    ) {
+                        MonthPager(
+                            state = monthPagerState,
+                            selected = selected,
+                            weekStart = weekStart,
+                            events = events,
+                            eventDateIndex = eventDateIndex,
+                            journals = journals,
+                            tasksByDueDate = tasksByDueDate,
+                            zoomState = currentZoom,
+                            compactGridHeight = splitGridHeight,
+                            detailedGridHeight = detailedGridHeight,
+                            // The day rail is intentionally pulled upward behind
+                            // the handle. The visible month ends where that rail
+                            // begins, not at the full measured month layer.
+                            // Deferred: this tracks the zoom, and reading it here
+                            // recomposed the month pager, all three of its page
+                            // trees and their 42 hit nodes on every drag sample.
+                            // Its only consumer is a drop, which reads it then.
+                            visibleGridHeight = {
+                                (calendarHeight.value + handleHeight - laneOverlap)
+                                    .coerceAtLeast(0.dp)
+                            },
+                            compactDay = weekStripDay,
+                            compactSelectorIndex = { compactSelectorIndex.value },
+                            compactDayPagerTravel = {
+                                dayPagerTravel.value.takeIf { abs(it) > .001f }
+                            },
+                            monthSelectorCrossing = {
+                                monthCrossingEnds?.let { (from, to) ->
+                                    MonthSelectorCrossing(from, to, monthCrossingProgress.value)
+                                }
+                            },
+                            compactBoundaryTransition = isDayPagerBoundaryTransition,
+                            compactLaneOwnedByWeek = weekPreviewActive,
+                            modifier = Modifier.fillMaxSize(),
+                            gestureModifier = Modifier,
+                            // At the compact endpoint the week pager is the sole
+                            // horizontal owner. Disable the month pager as soon
+                            // as the visual morph reaches its handoff threshold,
+                            // including while a reverse zoom settle is still in
+                            // flight.
+                            userScrollEnabled = interactionEnabled && monthPagerScrollable,
+                            onDay = { date ->
+                                if (interactionEnabled) {
+                                    // The split level is a selection surface. Only
+                                    // the detailed settled level opens the day modal.
+                                    val isDetailed = zoomState.floatValue >= 1.5f
+                                    selectedEpoch = date.toEpochDay()
+                                    onDateChanged(date)
+                                    if (isDetailed) onDayClick?.invoke(date)
+                                }
+                            },
+                            onEventClick = onEventClick,
+                            onEventAction = onEventAction,
                         )
+                    }
+                    // The handle stays attached to the shared surface, so it
+                    // travels with the month-to-week morph as one gesture
+                    // affordance. Turned off, it gives its band back to the day
+                    // surface and the vertical drag on the grid remains the way to
+                    // change zoom.
+                    if (showZoomHandle) {
                         Box(
-                            Modifier.fillMaxSize().graphicsLayer {
-                                translationX = monthPagerState
-                                    .getOffsetDistanceInPages(monthPreviewPage) * size.width
-                            }.background(CalinoColors.Canvas).padding(top = laneOverlap),
+                            Modifier.fillMaxWidth()
+                                .requiredHeight(handleHeight)
+                                .zIndex(6f)
+                                .offset {
+                                    IntOffset(0, with(density) { calendarHeight.value.roundToPx() })
+                                },
+                            // The bar occupies a half-height band but keeps a full
+                            // touch lane, which overflows this box evenly.
+                            contentAlignment = Alignment.Center,
                         ) {
-                            SelectedDayAgendaPage(
-                                day = previewDay,
-                                dayEvents = remember(eventDateIndex, previewDay) { eventDateIndex.eventsOn(previewDay) },
-                                dayTasks = tasksByDueDate[previewDay].orEmpty(),
-                                active = false,
-                                onEvent = null,
-                                onEventAction = null,
-                                onEventDrop = null,
-                                onTaskDone = null,
-                                onTaskClick = null,
-                                onTaskAction = null,
-                                onTaskDrop = null,
-                                onOpenDay = null,
+                            ZoomHandle(
+                                zoomLevel = zoomLevel,
+                                zoomBand = zoomBand,
+                                gestureModifier = Modifier,
+                                onTap = {
+                                    val level = zoomState.floatValue.roundToInt().coerceIn(0, 2)
+                                    animateZoomTo(if (level < 2) level + 1f else 1f)
+                                },
                             )
                         }
                     }
-                    if (weekAgendaPreview) {
-                        val previewDay = checkNotNull(weekAgendaPreviewDay)
-                        Box(
-                            Modifier.fillMaxSize().graphicsLayer {
-                                translationX = if (liveWeekAgendaPreview) {
-                                    weekPagerState
-                                        .getOffsetDistanceInPages(weekPreviewPage) * size.width
-                                } else {
-                                    0f
+
+                    // The rail runs up behind the handle and the compact strip
+                    // instead of starting below them, so hours slide under a
+                    // translucent lane rather than stopping at a hard edge. The
+                    // overlap only changes with the pull-bar setting, so this
+                    // never remeasures during a zoom drag; the lane's own scrim is
+                    // what hides the rail again once the month grid owns that
+                    // space.
+                    Box(
+                        Modifier.fillMaxWidth()
+                        // Keep the rail above the month surface where the two
+                        // surfaces overlap. The handle is explicitly above this
+                        // layer, so its compact tap lane cannot be swallowed by
+                        // the rail's large scroll container.
+                        .zIndex(2f)
+                            .requiredHeight(daySurfaceHeight + laneOverlap)
+                            .offset {
+                                IntOffset(
+                                    0,
+                                    with(density) {
+                                        (calendarHeight.value + handleHeight - laneOverlap).roundToPx()
+                                    },
+                                )
+                            }
+                            .clipToBounds(),
+                    ) {
+                        val selectedMonthPage = monthPageFor(YearMonth.from(selected))
+                        val monthPreviewPage by remember(monthPagerState, selectedMonthPage) {
+                            derivedStateOf {
+                                val distance = monthPagerState.getOffsetDistanceInPages(selectedMonthPage)
+                                when {
+                                    distance < -.001f -> selectedMonthPage + 1
+                                    distance > .001f -> selectedMonthPage - 1
+                                    else -> selectedMonthPage
+                                }.coerceIn(0, MonthPagerPageCount - 1)
+                            }
+                        }
+                        val monthAgendaPreview = headingUsesMonthPager && agendaOwnsInputNow &&
+                            monthPagerState.isScrollInProgress && isUserSettle(monthPagerState) &&
+                            monthPreviewPage != selectedMonthPage
+                        val selectedWeekPage = weekPageFor(selected, weekStart)
+                        val weekPreviewPage by remember(weekPagerState, selectedWeekPage) {
+                            derivedStateOf {
+                                val distance = weekPagerState.getOffsetDistanceInPages(selectedWeekPage)
+                                when {
+                                    distance < -.001f -> selectedWeekPage + 1
+                                    distance > .001f -> selectedWeekPage - 1
+                                    else -> selectedWeekPage
+                                }.coerceIn(0, WeekPagerPageCount - 1)
+                            }
+                        }
+                        val liveWeekAgendaPreview = !headingUsesMonthPager && agendaOwnsInputNow &&
+                            isUserSettle(weekPagerState) && weekPreviewPage != selectedWeekPage
+                        val weekAgendaPreviewDay = when {
+                            liveWeekAgendaPreview -> weekStartForPage(weekPreviewPage, weekStart)
+                                .plusDays(selected.weekdayColumn(weekStart).toLong())
+                            weekAgendaHandoffDay != null -> weekAgendaHandoffDay
+                            else -> null
+                        }
+                        val weekAgendaPreview = !headingUsesMonthPager && agendaOwnsInputNow &&
+                            weekAgendaPreviewDay != null
+                        DayPagerSurface(
+                            state = dayPagerState,
+                            events = events,
+                            eventDateIndex = eventDateIndex,
+                            tasksByDueDate = tasksByDueDate,
+                            modifier = Modifier.fillMaxSize().graphicsLayer {
+                                translationX = when {
+                                    monthAgendaPreview -> monthPagerState
+                                        .getOffsetDistanceInPages(selectedMonthPage) * size.width
+                                    liveWeekAgendaPreview -> weekPagerState
+                                        .getOffsetDistanceInPages(selectedWeekPage) * size.width
+                                    else -> 0f
                                 }
-                            }.background(CalinoColors.Canvas).padding(top = laneOverlap),
-                        ) {
-                            SelectedDayAgendaPage(
-                                day = previewDay,
-                                dayEvents = remember(eventDateIndex, previewDay) {
-                                    eventDateIndex.eventsOn(previewDay)
-                                },
-                                dayTasks = tasksByDueDate[previewDay].orEmpty(),
-                                active = false,
-                                onEvent = null,
-                                onEventAction = null,
-                                onEventDrop = null,
-                                onTaskDone = null,
-                                onTaskClick = null,
-                                onTaskAction = null,
-                                onTaskDrop = null,
-                                onOpenDay = null,
+                            },
+                            interactionEnabled = interactionEnabled,
+                            zoomState = currentZoom,
+                            laneOverlap = laneOverlap,
+                            agendaOwnsInput = agendaOwnsInputNow,
+                            agendaScroll = agendaScroll,
+                            onEvent = onEventClick,
+                            onEventAction = onEventAction,
+                            onEventDrop = onEventDrop,
+                            onTaskDone = onTaskDone,
+                            onTaskClick = onTaskClick,
+                            onTaskAction = onTaskAction,
+                            onTaskDrop = onTaskDrop,
+                            onOpenDay = splitOpenDay,
+                        )
+                        if (monthAgendaPreview) {
+                            val previewMonth = monthForPage(monthPreviewPage)
+                            val previewDay = previewMonth.atDay(
+                                selected.dayOfMonth.coerceAtMost(previewMonth.lengthOfMonth()),
                             )
+                            Box(
+                                Modifier.fillMaxSize().graphicsLayer {
+                                    translationX = monthPagerState
+                                        .getOffsetDistanceInPages(monthPreviewPage) * size.width
+                                }.background(CalinoColors.Canvas).padding(top = laneOverlap),
+                            ) {
+                                SelectedDayAgendaPage(
+                                    day = previewDay,
+                                    dayEvents = remember(eventDateIndex, previewDay) { eventDateIndex.eventsOn(previewDay) },
+                                    dayTasks = tasksByDueDate[previewDay].orEmpty(),
+                                    active = false,
+                                    onEvent = null,
+                                    onEventAction = null,
+                                    onEventDrop = null,
+                                    onTaskDone = null,
+                                    onTaskClick = null,
+                                    onTaskAction = null,
+                                    onTaskDrop = null,
+                                    onOpenDay = null,
+                                )
+                            }
+                        }
+                        if (weekAgendaPreview) {
+                            val previewDay = checkNotNull(weekAgendaPreviewDay)
+                            Box(
+                                Modifier.fillMaxSize().graphicsLayer {
+                                    translationX = if (liveWeekAgendaPreview) {
+                                        weekPagerState
+                                            .getOffsetDistanceInPages(weekPreviewPage) * size.width
+                                    } else {
+                                        0f
+                                    }
+                                }.background(CalinoColors.Canvas).padding(top = laneOverlap),
+                            ) {
+                                SelectedDayAgendaPage(
+                                    day = previewDay,
+                                    dayEvents = remember(eventDateIndex, previewDay) {
+                                        eventDateIndex.eventsOn(previewDay)
+                                    },
+                                    dayTasks = tasksByDueDate[previewDay].orEmpty(),
+                                    active = false,
+                                    onEvent = null,
+                                    onEventAction = null,
+                                    onEventDrop = null,
+                                    onTaskDone = null,
+                                    onTaskClick = null,
+                                    onTaskAction = null,
+                                    onTaskDrop = null,
+                                    onOpenDay = null,
+                                )
+                            }
                         }
                     }
                 }
@@ -5763,38 +5776,47 @@ private fun DayPagerSurface(
     onTaskDrop: ((CalTask, LocalDate) -> Unit)?,
     onOpenDay: ((LocalDate) -> Unit)?,
 ) {
-    HorizontalPager(
-        state = state,
-        modifier = modifier.clipToBounds().testTag("day-pager"),
-        beyondViewportPageCount = 0,
-        userScrollEnabled = interactionEnabled,
-        key = { page -> dateForDayPage(page).toEpochDay() },
-    ) { page ->
-        val pageDay = dateForDayPage(page)
-        val dayEvents = remember(eventDateIndex, pageDay) { eventDateIndex.eventsOn(pageDay) }
-        val dayTasks = tasksByDueDate[pageDay].orEmpty()
-        Box(
-            Modifier.fillMaxSize().padding(top = laneOverlap).graphicsLayer {
-                alpha = 1f - calendarTransitionFrame(zoomState.value).detailProgress
-            }.drawWithContent {
-                if (calendarTransitionFrame(zoomState.value).agendaVisible) drawContent()
-            },
-        ) {
-            SelectedDayAgendaPage(
-                day = pageDay,
-                dayEvents = dayEvents,
-                dayTasks = dayTasks,
-                scrollState = agendaScroll,
-                active = agendaOwnsInput,
-                onEvent = if (agendaOwnsInput) onEvent else null,
-                onEventAction = if (agendaOwnsInput) onEventAction else null,
-                onEventDrop = if (agendaOwnsInput) onEventDrop else null,
-                onTaskDone = if (agendaOwnsInput) onTaskDone else null,
-                onTaskClick = if (agendaOwnsInput) onTaskClick else null,
-                onTaskAction = if (agendaOwnsInput) onTaskAction else null,
-                onTaskDrop = if (agendaOwnsInput) onTaskDrop else null,
-                onOpenDay = if (agendaOwnsInput) onOpenDay else null,
-            )
+    // A lifted task row owns the pointer: the page must not turn under it.
+    var rowDragging by remember { mutableStateOf(false) }
+    // Pass the lock on, so a gesture further out (the calendar zoom) holds still too.
+    val outerRowDragLock = LocalRowDragLock.current
+    val rowDragLock = remember(outerRowDragLock) {
+        { dragging: Boolean -> rowDragging = dragging; outerRowDragLock(dragging) }
+    }
+    CompositionLocalProvider(LocalRowDragLock provides rowDragLock) {
+        HorizontalPager(
+            state = state,
+            modifier = modifier.clipToBounds().testTag("day-pager"),
+            beyondViewportPageCount = 0,
+            userScrollEnabled = (interactionEnabled) && !rowDragging,
+            key = { page -> dateForDayPage(page).toEpochDay() },
+        ) { page ->
+            val pageDay = dateForDayPage(page)
+            val dayEvents = remember(eventDateIndex, pageDay) { eventDateIndex.eventsOn(pageDay) }
+            val dayTasks = tasksByDueDate[pageDay].orEmpty()
+            Box(
+                Modifier.fillMaxSize().padding(top = laneOverlap).graphicsLayer {
+                    alpha = 1f - calendarTransitionFrame(zoomState.value).detailProgress
+                }.drawWithContent {
+                    if (calendarTransitionFrame(zoomState.value).agendaVisible) drawContent()
+                },
+            ) {
+                SelectedDayAgendaPage(
+                    day = pageDay,
+                    dayEvents = dayEvents,
+                    dayTasks = dayTasks,
+                    scrollState = agendaScroll,
+                    active = agendaOwnsInput,
+                    onEvent = if (agendaOwnsInput) onEvent else null,
+                    onEventAction = if (agendaOwnsInput) onEventAction else null,
+                    onEventDrop = if (agendaOwnsInput) onEventDrop else null,
+                    onTaskDone = if (agendaOwnsInput) onTaskDone else null,
+                    onTaskClick = if (agendaOwnsInput) onTaskClick else null,
+                    onTaskAction = if (agendaOwnsInput) onTaskAction else null,
+                    onTaskDrop = if (agendaOwnsInput) onTaskDrop else null,
+                    onOpenDay = if (agendaOwnsInput) onOpenDay else null,
+                )
+            }
         }
     }
 }
@@ -6014,90 +6036,99 @@ private fun LegacyDayPagerSurface(
                 onEmptyCancel = { createSession = null },
             ),
     ) {
-    HorizontalPager(
-        state = state,
-        modifier = Modifier.fillMaxSize().clipToBounds().testTag("day-pager"),
-            // The pager itself keeps the adjacent page that is entering the
-            // viewport. Extra eagerly composed month grids are expensive while
-            // zoom continuously changes every cell's measured height.
-            beyondViewportPageCount = 0,
-        userScrollEnabled = interactionEnabled,
-        key = { page -> dateForDayPage(page).toEpochDay() },
-    ) { page ->
-        val pageDay = dateForDayPage(page)
-        val placedEvents = remember(events, pendingDrop) { withPendingDrop(events, pendingDrop) }
-        val placedEventIndex = remember(placedEvents, eventDateIndex) {
-            if (placedEvents === events) eventDateIndex else EventDateIndex.build(placedEvents)
-        }
-        val dayEvents = remember(placedEventIndex, pageDay) { placedEventIndex.eventsOn(pageDay) }
-        val dayTasks = tasksByDueDate[pageDay].orEmpty()
-        Box(Modifier.fillMaxSize()) {
-            // Keep the rail mounted until the agenda has covered it. The
-            // incoming surface uses an opaque clipped reveal instead of a
-            // full-screen alpha crossfade: both endpoint trees remain stable,
-            // but their text and event cards never render as a ghosted double.
-            Box(Modifier.fillMaxSize().then(dayRailVisibility)) {
-                DayRailPage(
-                    day = pageDay,
-                    dayEvents = dayEvents,
-                    scrollState = scrollState,
-                    dayTasks = dayTasks,
-                    laneOverlap = laneOverlap,
-                    timelineScale = timelineScale,
-                    onTimelinePinch = onTimelinePinch,
-                    laneBlend = { (1f - zoomState.value / MonthEndpointBlendEnd).coerceIn(0f, 1f) },
-                    active = dayRailOwnsInput,
-                    scrollEnabled = dayRailOwnsInput,
-                    onEvent = if (dayRailOwnsInput) onEvent else null,
-                    onEventAction = if (dayRailOwnsInput) onEventAction else null,
-                    onEventDrop = if (dayRailOwnsInput) onEventDrop else null,
-                    draggingCardKey = dragSession?.card?.key,
-                    onCardBounds = if (railGestureEnabled) {
-                        { bounds -> cardBounds[bounds.key] = bounds }
-                    } else {
-                        null
-                    },
-                    onCardGone = if (railGestureEnabled) {
-                        { key -> cardBounds.remove(key) }
-                    } else {
-                        null
-                    },
-                    onTaskDone = if (dayRailOwnsInput) onTaskDone else null,
-                    onTaskClick = if (dayRailOwnsInput) onTaskClick else null,
-                    onTaskAction = if (dayRailOwnsInput) onTaskAction else null,
-                    onTaskDrop = if (dayRailOwnsInput) onTaskDrop else null,
-                    onLaneHeight = { activeLaneHeightPx = it },
-                )
+    // A lifted task row owns the pointer: the page must not turn under it.
+    var rowDragging by remember { mutableStateOf(false) }
+    // Pass the lock on, so a gesture further out (the calendar zoom) holds still too.
+    val outerRowDragLock = LocalRowDragLock.current
+    val rowDragLock = remember(outerRowDragLock) {
+        { dragging: Boolean -> rowDragging = dragging; outerRowDragLock(dragging) }
+    }
+    CompositionLocalProvider(LocalRowDragLock provides rowDragLock) {
+        HorizontalPager(
+            state = state,
+            modifier = Modifier.fillMaxSize().clipToBounds().testTag("day-pager"),
+                // The pager itself keeps the adjacent page that is entering the
+                // viewport. Extra eagerly composed month grids are expensive while
+                // zoom continuously changes every cell's measured height.
+                beyondViewportPageCount = 0,
+            userScrollEnabled = (interactionEnabled) && !rowDragging,
+            key = { page -> dateForDayPage(page).toEpochDay() },
+        ) { page ->
+            val pageDay = dateForDayPage(page)
+            val placedEvents = remember(events, pendingDrop) { withPendingDrop(events, pendingDrop) }
+            val placedEventIndex = remember(placedEvents, eventDateIndex) {
+                if (placedEvents === events) eventDateIndex else EventDateIndex.build(placedEvents)
             }
-            Box(
-                Modifier.fillMaxSize().padding(top = laneOverlap).drawWithContent {
-                    val transition = calendarTransitionFrame(zoomState.value)
-                    if (transition.agendaVisible) {
-                        val reveal = transition.unfoldProgress
-                        clipRect(bottom = size.height * reveal) {
-                            // Cover the rail before drawing the incoming
-                            // agenda so the transition has one readable
-                            // surface at every frame.
-                            drawRect(colors.Canvas)
-                            this@drawWithContent.drawContent()
+            val dayEvents = remember(placedEventIndex, pageDay) { placedEventIndex.eventsOn(pageDay) }
+            val dayTasks = tasksByDueDate[pageDay].orEmpty()
+            Box(Modifier.fillMaxSize()) {
+                // Keep the rail mounted until the agenda has covered it. The
+                // incoming surface uses an opaque clipped reveal instead of a
+                // full-screen alpha crossfade: both endpoint trees remain stable,
+                // but their text and event cards never render as a ghosted double.
+                Box(Modifier.fillMaxSize().then(dayRailVisibility)) {
+                    DayRailPage(
+                        day = pageDay,
+                        dayEvents = dayEvents,
+                        scrollState = scrollState,
+                        dayTasks = dayTasks,
+                        laneOverlap = laneOverlap,
+                        timelineScale = timelineScale,
+                        onTimelinePinch = onTimelinePinch,
+                        laneBlend = { (1f - zoomState.value / MonthEndpointBlendEnd).coerceIn(0f, 1f) },
+                        active = dayRailOwnsInput,
+                        scrollEnabled = dayRailOwnsInput,
+                        onEvent = if (dayRailOwnsInput) onEvent else null,
+                        onEventAction = if (dayRailOwnsInput) onEventAction else null,
+                        onEventDrop = if (dayRailOwnsInput) onEventDrop else null,
+                        draggingCardKey = dragSession?.card?.key,
+                        onCardBounds = if (railGestureEnabled) {
+                            { bounds -> cardBounds[bounds.key] = bounds }
+                        } else {
+                            null
+                        },
+                        onCardGone = if (railGestureEnabled) {
+                            { key -> cardBounds.remove(key) }
+                        } else {
+                            null
+                        },
+                        onTaskDone = if (dayRailOwnsInput) onTaskDone else null,
+                        onTaskClick = if (dayRailOwnsInput) onTaskClick else null,
+                        onTaskAction = if (dayRailOwnsInput) onTaskAction else null,
+                        onTaskDrop = if (dayRailOwnsInput) onTaskDrop else null,
+                        onLaneHeight = { activeLaneHeightPx = it },
+                    )
+                }
+                Box(
+                    Modifier.fillMaxSize().padding(top = laneOverlap).drawWithContent {
+                        val transition = calendarTransitionFrame(zoomState.value)
+                        if (transition.agendaVisible) {
+                            val reveal = transition.unfoldProgress
+                            clipRect(bottom = size.height * reveal) {
+                                // Cover the rail before drawing the incoming
+                                // agenda so the transition has one readable
+                                // surface at every frame.
+                                drawRect(colors.Canvas)
+                                this@drawWithContent.drawContent()
+                            }
                         }
-                    }
-                },
-            ) {
-                if (agendaMounted) SelectedDayAgendaPage(
-                    day = pageDay,
-                    dayEvents = dayEvents,
-                    dayTasks = dayTasks,
-                    active = agendaOwnsInput,
-                    onEvent = if (agendaOwnsInput) onEvent else null,
-                    onEventAction = if (agendaOwnsInput) onEventAction else null,
-                    onEventDrop = if (agendaOwnsInput) onEventDrop else null,
-                    onTaskDone = if (agendaOwnsInput) onTaskDone else null,
-                    onTaskClick = if (agendaOwnsInput) onTaskClick else null,
-                    onTaskAction = if (agendaOwnsInput) onTaskAction else null,
-                    onTaskDrop = if (agendaOwnsInput) onTaskDrop else null,
-                    onOpenDay = if (agendaOwnsInput) onOpenDay else null,
-                )
+                    },
+                ) {
+                    if (agendaMounted) SelectedDayAgendaPage(
+                        day = pageDay,
+                        dayEvents = dayEvents,
+                        dayTasks = dayTasks,
+                        active = agendaOwnsInput,
+                        onEvent = if (agendaOwnsInput) onEvent else null,
+                        onEventAction = if (agendaOwnsInput) onEventAction else null,
+                        onEventDrop = if (agendaOwnsInput) onEventDrop else null,
+                        onTaskDone = if (agendaOwnsInput) onTaskDone else null,
+                        onTaskClick = if (agendaOwnsInput) onTaskClick else null,
+                        onTaskAction = if (agendaOwnsInput) onTaskAction else null,
+                        onTaskDrop = if (agendaOwnsInput) onTaskDrop else null,
+                        onOpenDay = if (agendaOwnsInput) onOpenDay else null,
+                    )
+                }
             }
         }
     }

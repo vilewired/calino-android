@@ -4,6 +4,7 @@ import androidx.compose.foundation.shape.CornerSize
 import androidx.compose.ui.unit.Density
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.IntrinsicSize
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.runtime.Immutable
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.semantics.disabled
@@ -173,7 +174,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.lerp as lerpDp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
-import calino.malinov.ski.state.TaskInsertEdge
 import calino.malinov.ski.data.model.CalEvent
 import calino.malinov.ski.data.model.CalTask
 import calino.malinov.ski.design.CalinoColors
@@ -220,6 +220,13 @@ private val Mono = androidx.compose.ui.text.font.FontFamily.Monospace
  * fires along with a short haptic tick, so the affordance appears while the
  * finger is still deciding instead of confirming a drag already underway.
  */
+/**
+ * Told `true` while a row's long-press drag owns the pointer and `false` when it
+ * lets go. A pager around such rows provides it and stops paging meanwhile, so
+ * a lifted task cannot also turn the page underneath it. The default ignores it.
+ */
+val LocalRowDragLock = staticCompositionLocalOf<(Boolean) -> Unit> { {} }
+
 @Composable
 fun Modifier.calinoLongPressDrag(
     enabled: Boolean = true,
@@ -241,6 +248,7 @@ fun Modifier.calinoLongPressDrag(
     val currentOnDrag by rememberUpdatedState(onDrag)
     val currentOnDragEnd by rememberUpdatedState(onDragEnd)
     val currentOnDragCancel by rememberUpdatedState(onDragCancel)
+    val currentRowDragLock by rememberUpdatedState(LocalRowDragLock.current)
     val haptics = LocalHapticFeedback.current
     return this.pointerInput(Unit) {
         awaitEachGesture {
@@ -293,6 +301,7 @@ fun Modifier.calinoLongPressDrag(
                         if (!armed) {
                             armed = true
                             haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                            currentRowDragLock(true)
                             currentOnDragArmed?.invoke()
                         } else if (!menuShown) {
                             menuShown = true
@@ -341,6 +350,7 @@ fun Modifier.calinoLongPressDrag(
                         if (!armed) {
                             armed = true
                             haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                            currentRowDragLock(true)
                             currentOnDragArmed?.invoke()
                         }
                         dragging = true
@@ -356,6 +366,7 @@ fun Modifier.calinoLongPressDrag(
                 }
             } finally {
                 if (armed && !finished) currentOnDragCancel?.invoke()
+                if (armed) currentRowDragLock(false)
             }
         }
     }
@@ -915,8 +926,6 @@ fun AgendaRow(
     onDragMove: ((Float) -> Unit)? = null,
     onDragEnd: ((Offset) -> Unit)? = null,
     onDragCancel: (() -> Unit)? = null,
-    /** A drag would put its task just above or below this row. */
-    insertEdge: TaskInsertEdge? = null,
     trailingDescription: String? = null,
     struck: Boolean = false,
     trailing: (@Composable () -> Unit)? = null,
@@ -929,10 +938,6 @@ fun AgendaRow(
     var lifted by remember(title) { mutableStateOf(false) }
     val liftScale by animateFloatAsState(if (lifted) 1.02f else 1f, tween(120), label = "agenda row lift")
     val liftElevation by animateDpAsState(if (lifted) 8.dp else 0.dp, tween(120), label = "agenda row lift shadow")
-    var lastInsertEdge by remember(title) { mutableStateOf(insertEdge) }
-    LaunchedEffect(insertEdge) { if (insertEdge != null) lastInsertEdge = insertEdge }
-    val insertAlpha by animateFloatAsState(if (insertEdge != null) 1f else 0f, tween(100), label = "agenda insert line")
-    val insertColor = CalinoColors.Accent
     val surface = if (isCard) {
         Modifier
             .clip(shape)
@@ -981,22 +986,6 @@ fun AgendaRow(
             .shadow(liftElevation, shape, clip = false)
             .then(surface)
             .then(if (lifted && isCard) Modifier.border(1.5.dp, CalinoColors.Accent, shape) else Modifier)
-            .drawWithContent {
-                drawContent()
-                val edge = lastInsertEdge
-                if (insertAlpha > 0f && edge != null) {
-                    val stroke = 3.dp.toPx()
-                    val y = if (edge == TaskInsertEdge.Before) stroke / 2f else size.height - stroke / 2f
-                    val inset = 10.dp.toPx()
-                    drawLine(
-                        insertColor.copy(alpha = insertAlpha),
-                        Offset(inset, y),
-                        Offset(size.width - inset, y),
-                        stroke,
-                        cap = StrokeCap.Round,
-                    )
-                }
-            }
             .zIndex(if (lifted || abs(dragOffsetY) > .5f) 1f else 0f)
             .semantics(mergeDescendants = true) {
                 contentDescription = buildString {
@@ -1157,10 +1146,10 @@ fun AgendaTaskRow(
     onClick: (() -> Unit)? = null,
     onCheckedChange: ((Boolean) -> Unit)? = null,
     onLongClick: (() -> Unit)? = null,
+    onDragStart: (() -> Unit)? = null,
     onDragMove: ((Float) -> Unit)? = null,
     onDragEnd: ((Offset) -> Unit)? = null,
     onDragCancel: (() -> Unit)? = null,
-    insertEdge: TaskInsertEdge? = null,
 ) {
     val color = eventColor(task.color)
     val completedLabel = stringResource(R.string.cal_completed).lowercase(LocalCalinoLocale)
@@ -1177,10 +1166,10 @@ fun AgendaTaskRow(
         variant = AgendaRowVariant.Card,
         onClick = onClick,
         onLongClick = onLongClick,
+        onDragStart = onDragStart,
         onDragMove = onDragMove,
         onDragEnd = onDragEnd,
         onDragCancel = onDragCancel,
-        insertEdge = insertEdge,
         trailingDescription = if (task.done) completedLabel else openLabel,
         struck = task.done,
         trailing = {
@@ -1221,6 +1210,10 @@ fun AgendaRow(
     onLongClick: (() -> Unit)? = null,
     onDragEnd: ((Offset) -> Unit)? = null,
     checkboxTouchSize: androidx.compose.ui.unit.Dp? = null,
+    onDragStart: (() -> Unit)? = null,
+    /** The vertical distance dragged so far, on every move. */
+    onDragMove: ((Float) -> Unit)? = null,
+    onDragCancel: (() -> Unit)? = null,
 ) {
     val color = eventColor(task.color)
     val stripeColor = priorityStripeColor(task.priority)
@@ -1232,6 +1225,15 @@ fun AgendaRow(
     val completedLabel = stringResource(R.string.cal_completed)
     val openLabel = stringResource(R.string.cal_open)
     var dragOffsetY by remember(task.id) { mutableFloatStateOf(0f) }
+    // Held long enough to move: the row lifts onto a soft panel, so the hold
+    // reads as "picked up" even without a haptic tick.
+    var lifted by remember(task.id) { mutableStateOf(false) }
+    val liftScale by animateFloatAsState(if (lifted) 1.02f else 1f, tween(120), label = "task row lift")
+    val liftFill by animateColorAsState(
+        if (lifted) CalinoColors.AccentSoft.copy(alpha = .7f) else Color.Transparent,
+        tween(120),
+        label = "task row lift fill",
+    )
     val description = buildString {
         append(if (!compact) task.due?.let { stringResource(R.string.cal_task_due_label, task.title, it.format(dateFormat)) } ?: task.title else task.title)
         task.category?.let { append(", ").append(it) }
@@ -1251,10 +1253,11 @@ fun AgendaRow(
         Modifier.calinoLongPressDrag(
             onClick = onClick,
             onLongPress = onLongClick,
-            onDragStart = { dragOffsetY = 0f },
-            onDrag = { amount -> dragOffsetY += amount.y },
-            onDragEnd = { offset -> onDragEnd(offset); dragOffsetY = 0f },
-            onDragCancel = { dragOffsetY = 0f },
+            onDragArmed = { lifted = true },
+            onDragStart = { lifted = true; dragOffsetY = 0f; onDragStart?.invoke() },
+            onDrag = { amount -> dragOffsetY += amount.y; onDragMove?.invoke(dragOffsetY) },
+            onDragEnd = { offset -> onDragEnd(offset); dragOffsetY = 0f; lifted = false },
+            onDragCancel = { dragOffsetY = 0f; lifted = false; onDragCancel?.invoke() },
         )
     } else {
         rowPressModifier
@@ -1264,8 +1267,13 @@ fun AgendaRow(
             .fillMaxWidth()
             .heightIn(min = if (compact) 36.dp else 44.dp)
             .then(rowInteraction)
-            .graphicsLayer { translationY = dragOffsetY }
-            .zIndex(if (abs(dragOffsetY) > .5f) 1f else 0f)
+            .graphicsLayer {
+                translationY = dragOffsetY
+                scaleX = liftScale
+                scaleY = liftScale
+            }
+            .background(liftFill, RoundedCornerShape(10.dp))
+            .zIndex(if (lifted || abs(dragOffsetY) > .5f) 1f else 0f)
             .semantics(mergeDescendants = true) {
                 contentDescription = description
                 stateDescription = if (task.done) completedLabel else openLabel
@@ -1725,7 +1733,13 @@ fun TaskRow(
     onLongClick: (() -> Unit)? = null,
     compact: Boolean = false,
     onDragEnd: ((Offset) -> Unit)? = null,
-) = AgendaRow(task, modifier, onClick, onCheckedChange, compact, onLongClick, onDragEnd)
+    onDragStart: (() -> Unit)? = null,
+    onDragMove: ((Float) -> Unit)? = null,
+    onDragCancel: (() -> Unit)? = null,
+) = AgendaRow(
+    task, modifier, onClick, onCheckedChange, compact, onLongClick, onDragEnd,
+    onDragStart = onDragStart, onDragMove = onDragMove, onDragCancel = onDragCancel,
+)
 
 /**
  * Shared compact choice control for the mobile surfaces.

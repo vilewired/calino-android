@@ -1,5 +1,10 @@
 package calino.malinov.ski.ui.components
 
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
+import calino.malinov.ski.state.TaskReorderPlan
+import calino.malinov.ski.state.isReorderable
 import calino.malinov.ski.R
 import androidx.compose.ui.res.stringResource
 import calino.malinov.ski.util.localizedDateFormatter
@@ -138,6 +143,8 @@ fun NavSidebar(
     onTaskClick: (CalTask) -> Unit = {},
     onTaskComplete: (CalTask, Boolean) -> Unit = { _, _ -> },
     onTaskAction: (TaskMenuAction, CalTask) -> Unit = { _, _ -> },
+    /** A held upcoming task dropped into a new place within its day. */
+    onTaskReorder: ((TaskReorderPlan) -> Unit)? = null,
     updateAvailable: Boolean = false,
     onUpdateClick: () -> Unit = {},
     modifier: Modifier = Modifier,
@@ -340,6 +347,7 @@ fun NavSidebar(
                             onTaskClick = onTaskClick,
                             onTaskComplete = onTaskComplete,
                             onTaskAction = onTaskAction,
+                            onTaskReorder = onTaskReorder,
                         )
                         SidebarSectionLabel(stringResource(R.string.cal_views_group))
                         SidebarNavGroup {
@@ -651,6 +659,7 @@ private fun SidebarUpcomingTasks(
     onTaskClick: (CalTask) -> Unit,
     onTaskComplete: (CalTask, Boolean) -> Unit,
     onTaskAction: (TaskMenuAction, CalTask) -> Unit,
+    onTaskReorder: ((TaskReorderPlan) -> Unit)?,
 ) {
     var expanded by remember { mutableStateOf(false) }
     val chevronRotation by animateFloatAsState(
@@ -716,16 +725,55 @@ private fun SidebarUpcomingTasks(
             enter = expandVertically(tween(CalinoMotion.ContentEnterMillis)) + fadeIn(tween(CalinoMotion.ContentEnterMillis)),
             exit = shrinkVertically(tween(CalinoMotion.ContentExitMillis)) + fadeOut(tween(CalinoMotion.ContentExitMillis)),
         ) {
+            // Hold a task to lift it, then drag: the others of its day slide
+            // apart to open the gap it would land in (see rowReorderPreview).
+            val rowBounds = remember { mutableMapOf<String, Rect>() }
+            var draggingTaskId by remember { mutableStateOf<String?>(null) }
+            var dragY by remember { mutableFloatStateOf(0f) }
+            val snapPx = with(LocalDensity.current) { 8.dp.toPx() }
+            val reorder = remember(draggingTaskId, dragY, upcoming) {
+                if (onTaskReorder == null) return@remember null
+                val dragged = upcoming.firstOrNull { it.id == draggingTaskId } ?: return@remember null
+                val source = rowBounds[dragged.id] ?: return@remember null
+                if (!dragged.isReorderable()) return@remember null
+                rowReorderPreview(
+                    rowTasks = upcoming,
+                    rowDepth = emptyMap(),
+                    rowBounds = rowBounds,
+                    dragged = dragged,
+                    draggedCenter = source.center.y + dragY,
+                    slot = source.height,
+                    snap = snapPx,
+                )
+            }
             Column {
                 upcoming.forEach { task ->
                     var menuOpen by remember(task.id) { mutableStateOf(false) }
-                    Box(Modifier.fillMaxWidth()) {
+                    val shift by animateFloatAsState(
+                        targetValue = reorder?.shifts?.get(task.id) ?: 0f,
+                        animationSpec = tween(140),
+                        label = "sidebar reorder gap",
+                    )
+                    Box(
+                        Modifier
+                            .fillMaxWidth()
+                            .onGloballyPositioned { rowBounds[task.id] = it.boundsInRoot() }
+                            .graphicsLayer { translationY = shift },
+                    ) {
                         TaskRow(
                             task = task,
                             compact = true,
                             onCheckedChange = { onTaskComplete(task, it) },
                             onClick = { onTaskClick(task) },
                             onLongClick = { menuOpen = true },
+                            onDragStart = { menuOpen = false },
+                            onDragMove = { distance -> draggingTaskId = task.id; dragY = distance },
+                            onDragEnd = if (onTaskReorder == null) null else ({ _ ->
+                                reorder?.plan?.let(onTaskReorder)
+                                draggingTaskId = null
+                                dragY = 0f
+                            }),
+                            onDragCancel = { draggingTaskId = null; dragY = 0f },
                         )
                         TaskActionMenu(
                             task = task,
