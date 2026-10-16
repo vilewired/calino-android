@@ -1,5 +1,8 @@
 package calino.malinov.ski.ui.home
 
+import calino.malinov.ski.state.isReorderable
+import calino.malinov.ski.state.LocalTaskReorder
+import calino.malinov.ski.ui.components.rowReorderPreview
 import calino.malinov.ski.ui.components.LocalRowDragLock
 import android.os.Build
 import androidx.activity.compose.PredictiveBackHandler
@@ -2974,7 +2977,35 @@ private fun DayTasksSection(
                 verticalArrangement = Arrangement.spacedBy(0.dp),
             ) {
                 val taskLookup = LocalTaskLookup.current
-                nestWithinList(dayTasks, taskLookup).forEach { row ->
+                val listRows = nestWithinList(dayTasks, taskLookup)
+                // Hold a task to lift it, then drag: the day's other tasks slide
+                // apart to open the gap it lands in (see rowReorderPreview). A
+                // drag well away from them still moves it to another day.
+                val onTaskReorder = LocalTaskReorder.current
+                val rowTasks = remember(listRows) { listRows.filterIsInstance<TaskListRow.Item>().map { it.task } }
+                val rowDepth = remember(listRows) {
+                    listRows.filterIsInstance<TaskListRow.Item>().associate { it.task.id to it.depth }
+                }
+                val rowBounds = remember { mutableMapOf<String, Rect>() }
+                var draggingTaskId by remember { mutableStateOf<String?>(null) }
+                var dragY by remember { mutableFloatStateOf(0f) }
+                val snapPx = with(LocalDensity.current) { 8.dp.toPx() }
+                val reorder = remember(draggingTaskId, dragY, rowTasks) {
+                    if (onTaskReorder == null) return@remember null
+                    val dragged = rowTasks.firstOrNull { it.id == draggingTaskId } ?: return@remember null
+                    val source = rowBounds[dragged.id] ?: return@remember null
+                    if (!dragged.isReorderable()) return@remember null
+                    rowReorderPreview(
+                        rowTasks = rowTasks,
+                        rowDepth = rowDepth,
+                        rowBounds = rowBounds,
+                        dragged = dragged,
+                        draggedCenter = source.center.y + dragY,
+                        slot = source.height,
+                        snap = snapPx,
+                    )
+                }
+                listRows.forEach { row ->
                     when (row) {
                         // Indented to the checkbox column, like the rows: the
                         // rail drops from where the parent's own checkbox would
@@ -2985,15 +3016,38 @@ private fun DayTasksSection(
                             onClick = onTaskClick?.let { callback -> { callback(row.parent) } },
                         )
 
-                        is TaskListRow.Item -> CalendarTaskRow(
-                            task = row.task,
-                            onTaskDone = onTaskDone?.let { callback -> { done -> callback(row.task, done) } },
-                            onTaskClick = onTaskClick?.let { callback -> { callback(row.task) } },
-                            onTaskAction = onTaskAction?.let { callback -> { action, target -> callback(action, target) } },
-                            onTaskDrop = onTaskDrop,
-                            depth = row.depth,
-                            nestingLines = row.nestingLines,
-                        )
+                        is TaskListRow.Item -> {
+                            val shift by animateFloatAsState(
+                                targetValue = reorder?.shifts?.get(row.task.id) ?: 0f,
+                                animationSpec = tween(140),
+                                label = "day task reorder gap",
+                            )
+                            CalendarTaskRow(
+                                task = row.task,
+                                onTaskDone = onTaskDone?.let { callback -> { done -> callback(row.task, done) } },
+                                onTaskClick = onTaskClick?.let { callback -> { callback(row.task) } },
+                                onTaskAction = onTaskAction?.let { callback -> { action, target -> callback(action, target) } },
+                                onTaskDrop = onTaskDrop,
+                                depth = row.depth,
+                                nestingLines = row.nestingLines,
+                                onReorderDrag = { distance -> draggingTaskId = row.task.id; dragY = distance },
+                                // True when the release stays in this day: it
+                                // reorders (or settles back), never reschedules.
+                                onReorderEnd = {
+                                    val preview = reorder
+                                    preview?.plan?.let { plan -> onTaskReorder?.invoke(plan) }
+                                    draggingTaskId = null
+                                    dragY = 0f
+                                    preview?.inDay == true
+                                },
+                                onReorderCancel = { draggingTaskId = null; dragY = 0f },
+                                modifier = Modifier
+                                    // Measured before the shift, so the gap logic
+                                    // works from where rows sit at rest.
+                                    .onGloballyPositioned { rowBounds[row.task.id] = it.boundsInRoot() }
+                                    .graphicsLayer { translationY = shift },
+                            )
+                        }
                     }
                 }
             }
@@ -3010,6 +3064,10 @@ private fun CalendarTaskRow(
     onTaskDrop: ((CalTask, LocalDate) -> Unit)? = null,
     depth: Int = 0,
     nestingLines: List<Boolean> = emptyList(),
+    onReorderDrag: ((Float) -> Unit)? = null,
+    /** Returns true when the release was handled as a reorder (or a settle back). */
+    onReorderEnd: (() -> Boolean)? = null,
+    onReorderCancel: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     var menuOpen by remember(task.id) { mutableStateOf(false) }
@@ -3036,8 +3094,15 @@ private fun CalendarTaskRow(
                 onClick = onTaskClick,
                 onLongClick = if (onTaskAction != null) { { menuOpen = true } } else null,
                 onDragEnd = onTaskDrop?.let { callback -> { offset ->
-                    if (abs(offset.y) > 36f) callback(task, baseDate.plusDays((offset.y / 76f).roundToInt().toLong()))
+                    val reordered = onReorderEnd?.invoke() == true
+                    if (!reordered && abs(offset.y) > 36f) {
+                        callback(task, baseDate.plusDays((offset.y / 76f).roundToInt().toLong()))
+                    }
                 } },
+                // A hold that turns into a drag is a move, not a menu request.
+                onDragStart = { menuOpen = false },
+                onDragMove = onReorderDrag,
+                onDragCancel = onReorderCancel,
                 compact = true,
             )
         }

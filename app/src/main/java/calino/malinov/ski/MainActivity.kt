@@ -1,5 +1,6 @@
 package calino.malinov.ski
 
+import androidx.compose.ui.platform.LocalViewConfiguration
 import calino.malinov.ski.ui.components.CalinoPressPoint
 import calino.malinov.ski.ui.components.SurfaceOriginBounds
 import calino.malinov.ski.ui.components.applyOriginMorph
@@ -235,6 +236,8 @@ import calino.malinov.ski.design.CalinoThemes
 import calino.malinov.ski.util.CalinoThemeChoice
 import calino.malinov.ski.state.LocalTaskLookup
 import calino.malinov.ski.state.LocalTaskReorderStep
+import calino.malinov.ski.state.LocalTaskReorder
+import calino.malinov.ski.state.TaskReorderPlan
 import calino.malinov.ski.state.planStep
 import calino.malinov.ski.data.repository.applyTaskReorder
 import calino.malinov.ski.state.FixtureNow
@@ -473,7 +476,15 @@ class MainActivity : ComponentActivity() {
         consumeInteropIntent(intent)
         consumeCalendarViewIntent(intent)
         enableEdgeToEdge()
-        setContent { CalinoApp() }
+        setContent {
+            // Hold a little longer before a press counts as a long press, so the
+            // edit/delete menus every row opens on a hold do not pop up while
+            // the finger is still settling. Drags start on their own shorter
+            // delay (min(timeout, 220 ms)) and are unaffected.
+            val baseViewConfiguration = LocalViewConfiguration.current
+            val viewConfiguration = remember(baseViewConfiguration) { MenuHoldViewConfiguration(baseViewConfiguration) }
+            CompositionLocalProvider(LocalViewConfiguration provides viewConfiguration) { CalinoApp() }
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -2164,10 +2175,14 @@ private fun CalinoAppContent(pocViewModel: PocRepositoryViewModel) {
     val taskReorderStep: (CalTask, Int) -> Boolean = remember(calendarTasks) {
         { task: CalTask, direction: Int -> planStep(calendarTasks, task, direction) != null }
     }
+    val taskReorder: (TaskReorderPlan) -> Unit = remember {
+        { plan: TaskReorderPlan -> launchWrite({ repository.applyTaskReorder(plan) }, indicate = PillWriteKind.Save) }
+    }
     CompositionLocalProvider(
         LocalCalinoSync provides syncStatus,
         LocalTaskLookup provides taskLookup,
         LocalTaskReorderStep provides taskReorderStep,
+        LocalTaskReorder provides taskReorder,
         calino.malinov.ski.state.LocalAttachmentOpener provides ::openAttachment,
     ) {
     // Keep the blur on the calendar/content sibling only. AI surfaces are
@@ -4081,4 +4096,13 @@ private fun aiDraftFor(candidate: AiEventCandidate, fallbackDate: LocalDate): Ed
         description = candidate.description,
         touched = calino.malinov.ski.data.model.EditorField.entries.toSet(),
     )
+}
+
+/** Extra hold, on top of the system long-press timeout, before a row's menu opens. */
+private const val MenuHoldExtraMillis = 250L
+
+private class MenuHoldViewConfiguration(
+    private val base: androidx.compose.ui.platform.ViewConfiguration,
+) : androidx.compose.ui.platform.ViewConfiguration by base {
+    override val longPressTimeoutMillis: Long get() = base.longPressTimeoutMillis + MenuHoldExtraMillis
 }

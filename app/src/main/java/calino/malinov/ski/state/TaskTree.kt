@@ -238,5 +238,12 @@ val LocalTaskLookup = staticCompositionLocalOf<(String) -> CalTask?> { { null } 
  */
 val LocalTaskReorderStep = staticCompositionLocalOf<(CalTask, Int) -> Boolean> { { _, _ -> false } }
 
+/**
+ * Writes a reorder made by dragging within a day's task list. Provided by the
+ * host; null where reordering is not available (a preview, a test), in which
+ * case a drag keeps its old meaning.
+ */
+val LocalTaskReorder = staticCompositionLocalOf<((TaskReorderPlan) -> Unit)?> { null }
+
 /** Opens an event's attachment: a link in its app, inline data through a cached file. */
 val LocalAttachmentOpener = staticCompositionLocalOf<(calino.malinov.ski.data.model.CalEvent, calino.malinov.ski.data.model.EventAttachment) -> Unit> { { _, _ -> } }
