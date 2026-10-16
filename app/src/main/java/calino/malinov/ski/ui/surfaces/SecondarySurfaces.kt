@@ -1,6 +1,5 @@
 package calino.malinov.ski.ui.surfaces
 
-import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.vector.ImageVector
 import calino.malinov.ski.ui.components.CalinoActionMenu
 import calino.malinov.ski.ui.components.CalinoActionMenuDivider
@@ -124,7 +123,6 @@ import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.draw.drawBehind
-import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.graphicsLayer
@@ -194,6 +192,7 @@ import calino.malinov.ski.state.LocalCalinoPreferences
 import calino.malinov.ski.state.LocalTimeFormat
 import calino.malinov.ski.state.TaskTree
 import calino.malinov.ski.state.LocalTaskReorderStep
+import calino.malinov.ski.state.isReorderable
 import calino.malinov.ski.state.TaskInsertEdge
 import calino.malinov.ski.state.TaskReorderPlan
 import calino.malinov.ski.state.planDropReorder
@@ -288,6 +287,49 @@ enum class TaskFilter { All, Active, Completed }
 
 /** Share of a task row's height, at its top and bottom, that reads as "between rows" during a drag. */
 private const val ReorderEdge = .25f
+
+/**
+ * How far each Tasks-screen row slides while [dragged] hovers [edge] of
+ * [target]: the gap opens where [plan] would put it. Rows in its new sibling
+ * group between its old and new place move by one [slot], each carrying the
+ * subtasks listed under it; joining a new parent only opens the gap.
+ */
+private fun taskReorderShifts(
+    rows: List<CalTask>,
+    tree: TaskTree,
+    dragged: CalTask,
+    target: CalTask,
+    edge: TaskInsertEdge,
+    plan: TaskReorderPlan,
+    slot: Float,
+): Map<String, Float> {
+    // planDropReorder may have moved the anchor to the first subtask below an
+    // expanded parent; the new parent tells which sibling group the gap is in.
+    val parent = plan.reparent?.second ?: dragged.parentTaskId
+    val group = rows.filter {
+        it.id != dragged.id && it.isReorderable() && it.due == dragged.due && it.parentTaskId == parent
+    }
+    val anchor = if (plan.reparent != null && target.parentTaskId != parent) group.firstOrNull() else target
+    val anchorIndex = group.indexOfFirst { it.id == anchor?.id }.takeIf { it >= 0 } ?: return emptyMap()
+    val to = if (edge == TaskInsertEdge.After && anchor == target) anchorIndex + 1 else anchorIndex
+    val from = if (plan.reparent == null) rows.filter { it.id == dragged.id || it in group }.indexOfFirst { it.id == dragged.id } else -1
+    fun block(member: CalTask): List<String> {
+        val start = rows.indexOfFirst { it.id == member.id }
+        val depth = tree.depth(member.id)
+        return listOf(member.id) + rows.drop(start + 1).takeWhile { tree.depth(it.id) > depth }.map { it.id }
+    }
+    val shifts = HashMap<String, Float>()
+    group.forEachIndexed { index, member ->
+        val offset = when {
+            from < 0 -> if (index >= to) slot else 0f
+            index < from && index >= to -> slot
+            index >= from && index < to -> -slot
+            else -> 0f
+        }
+        if (offset != 0f) block(member).forEach { shifts[it] = offset }
+    }
+    return shifts
+}
 
 /** What the dragged task would do on release: nest under [target], or (with [edge]) take the [plan]'s position. */
 private data class TaskDropHit(val target: CalTask, val edge: TaskInsertEdge?, val plan: TaskReorderPlan?)
@@ -2835,7 +2877,17 @@ fun TasksSurface(
         }
     }
     val dropTarget = dropHit?.takeIf { it.plan == null }?.target
-    val insertTarget = dropHit?.let { hit -> hit.edge?.let { hit.target.id to it } }
+    // A reorder opens a gap where the task will land: the rows it passes slide
+    // by one card. (A line at the target's edge would sit under the very card
+    // being dragged there.)
+    val reorderShifts = remember(dropHit, dragOrder) {
+        val hit = dropHit
+        val plan = hit?.plan
+        val dragged = dragOrder.firstOrNull { it.id == draggingTaskId }
+        if (hit == null || plan == null || dragged == null) return@remember emptyMap<String, Float>()
+        val slot = taskDropBounds[dragged.id]?.let { it.bottom - it.top } ?: return@remember emptyMap<String, Float>()
+        taskReorderShifts(dragOrder, taskTree, dragged, hit.target, hit.edge ?: return@remember emptyMap(), plan, slot)
+    }
     // Dragging a subtask clear of its indent is the inverse of dropping one row
     // onto another: it lets go of the parent without going through the menu.
     val unnestThresholdPx = with(LocalDensity.current) { 56.dp.toPx() }
@@ -2951,7 +3003,7 @@ fun TasksSurface(
                                 peekedTaskIds = peekedTaskIds,
                                 outsideChildren = ::outsideChildren,
                                 onCompleteAny = ::complete,
-                                insertTarget = insertTarget,
+                                reorderShifts = reorderShifts,
                             )
                         }
                         LazyColumn(
@@ -3071,8 +3123,8 @@ private fun LazyListScope.TaskBucket(
     outsideChildren: (CalTask) -> List<CalTask> = { emptyList() },
     /** Completes an open subtask shown here under a parent of another section. */
     onCompleteAny: (CalTask) -> Unit = onComplete,
-    /** The row a drag would insert next to, and on which side. */
-    insertTarget: Pair<String, TaskInsertEdge>? = null,
+    /** How far each row slides to open the gap a dragged task would land in. */
+    reorderShifts: Map<String, Float> = emptyMap(),
 ) {
     if (tasks.isNotEmpty()) {
         val ordered = orderTasksByDue(tasks)
@@ -3150,7 +3202,7 @@ private fun LazyListScope.TaskBucket(
                     onToggleSubtasks = { onToggleSubtasks(task) },
                     onTaskAction = onTaskAction,
                     isDropTarget = dropTarget?.id == task.id,
-                    insertEdge = if (peek) null else insertTarget?.takeIf { it.first == task.id }?.second,
+                    reorderShift = if (peek) 0f else reorderShifts[task.id] ?: 0f,
                     isUnnesting = unnestingTaskId == task.id,
                     // A peeked copy is not a drop target or a drag source: its
                     // real row, in its own section, owns those.
@@ -3230,8 +3282,8 @@ private fun TaskRow(
     onToggleSubtasks: () -> Unit = {},
     onTaskAction: (TaskMenuAction, CalTask) -> Unit = { _, _ -> },
     isDropTarget: Boolean = false,
-    /** A drag would put its task just above or below this row. */
-    insertEdge: TaskInsertEdge? = null,
+    /** Slide this row by, to open the gap a dragged task would land in. */
+    reorderShift: Float = 0f,
     isUnnesting: Boolean = false,
     onDragStart: (() -> Unit)? = null,
     onDrag: ((Offset) -> Unit)? = null,
@@ -3287,16 +3339,11 @@ private fun TaskRow(
         label = "task drop border",
     )
     val hairline = CalinoColors.Ink.copy(.06f)
-    // The insertion line fades in and out; the side it was last drawn on is
-    // kept so the fade-out does not jump to the other edge.
-    var lastInsertEdge by remember(task.id) { mutableStateOf(insertEdge) }
-    LaunchedEffect(insertEdge) { if (insertEdge != null) lastInsertEdge = insertEdge }
-    val insertAlpha by animateFloatAsState(
-        targetValue = if (insertEdge != null) 1f else 0f,
-        animationSpec = tween(100),
-        label = "task insert line",
+    val gapShift by animateFloatAsState(
+        targetValue = reorderShift,
+        animationSpec = tween(140),
+        label = "task reorder gap",
     )
-    val insertColor = CalinoColors.Accent
     val drawsDivider = groupPosition == TaskGroupPosition.First || groupPosition == TaskGroupPosition.Middle
     val canAct = !task.done
     val chevronRotation by animateFloatAsState(
@@ -3336,7 +3383,9 @@ private fun TaskRow(
 
     Column(
         modifier
+            // Measured before the gap shift, so drops work from where rows rest.
             .onGloballyPositioned { coordinates -> onPositioned?.invoke(coordinates) }
+            .graphicsLayer { translationY = gapShift }
             .fillMaxWidth()
             // The gap below a card; a grouped row sits flush on the next one.
             .padding(bottom = if (grouped) 0.dp else 10.dp)
@@ -3400,22 +3449,6 @@ private fun TaskRow(
                         } else Modifier,
                     )
                     .border(BorderStroke(if (isDropTarget) 2.dp else 1.dp, rowBorder), rowShape)
-                    .drawWithContent {
-                        drawContent()
-                        val edge = lastInsertEdge
-                        if (insertAlpha > 0f && edge != null) {
-                            val stroke = 3.dp.toPx()
-                            val y = if (edge == TaskInsertEdge.Before) stroke / 2f else size.height - stroke / 2f
-                            val inset = 12.dp.toPx()
-                            drawLine(
-                                insertColor.copy(alpha = insertAlpha),
-                                Offset(inset, y),
-                                Offset(size.width - inset, y),
-                                stroke,
-                                cap = StrokeCap.Round,
-                            )
-                        }
-                    }
                     .semantics { contentDescription = description }
                     .pointerInput(task.id, canAct) {
                         if (canAct) detectHorizontalDragGestures(

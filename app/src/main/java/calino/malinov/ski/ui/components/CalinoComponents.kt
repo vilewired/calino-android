@@ -209,9 +209,17 @@ import kotlinx.coroutines.withTimeoutOrNull
 private val Mono = androidx.compose.ui.text.font.FontFamily.Monospace
 
 /**
+ * Told `true` while a row's long-press drag owns the pointer and `false` when it
+ * lets go. A pager around such rows provides it and stops paging meanwhile, so
+ * a lifted task cannot also turn the page underneath it. The default ignores it.
+ */
+val LocalRowDragLock = staticCompositionLocalOf<(Boolean) -> Unit> { {} }
+
+/**
  * One gesture for an actionable row: a normal tap opens it, a held tap opens
- * its action menu, and movement after either the drag cue or the menu becomes
- * a drag. The important detail is that movement is left unconsumed until the
+ * its action menu, and movement after the drag cue becomes a drag. On a row
+ * that can be dragged the menu opens when a still hold is released, never
+ * while it is held, so a hold that turns into a drag does not flash a menu. The important detail is that movement is left unconsumed until the
  * drag activation delay has elapsed. A normal scroll therefore still belongs to
  * the LazyColumn instead of every row competing with it on every move.
  *
@@ -220,13 +228,6 @@ private val Mono = androidx.compose.ui.text.font.FontFamily.Monospace
  * fires along with a short haptic tick, so the affordance appears while the
  * finger is still deciding instead of confirming a drag already underway.
  */
-/**
- * Told `true` while a row's long-press drag owns the pointer and `false` when it
- * lets go. A pager around such rows provides it and stops paging meanwhile, so
- * a lifted task cannot also turn the page underneath it. The default ignores it.
- */
-val LocalRowDragLock = staticCompositionLocalOf<(Boolean) -> Unit> { {} }
-
 @Composable
 fun Modifier.calinoLongPressDrag(
     enabled: Boolean = true,
@@ -270,6 +271,11 @@ fun Modifier.calinoLongPressDrag(
             var totalDrag = Offset.Zero
             var armed = false
             var menuShown = false
+            // A row that can be dragged opens its menu on release rather than
+            // mid-hold: the hold that will become a drag must not flash a menu
+            // first. Rows without a drag keep the menu-while-holding.
+            val menuOnRelease = currentOnDrag != null || currentOnDragEnd != null
+            var menuPending = false
             var dragging = false
             var finished = false
             try {
@@ -286,7 +292,7 @@ fun Modifier.calinoLongPressDrag(
                     val elapsedBeforeWait = SystemClock.uptimeMillis() - downClock
                     val nextDeadline = when {
                         !armed -> dragDelay
-                        !menuShown && currentOnLongPress != null -> menuDelay
+                        !menuShown && !menuPending && currentOnLongPress != null -> menuDelay
                         else -> null
                     }
                     val remainingToDeadline = nextDeadline?.minus(elapsedBeforeWait)
@@ -303,6 +309,8 @@ fun Modifier.calinoLongPressDrag(
                             haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                             currentRowDragLock(true)
                             currentOnDragArmed?.invoke()
+                        } else if (menuOnRelease) {
+                            menuPending = true
                         } else if (!menuShown) {
                             menuShown = true
                             currentOnLongPress?.invoke()
@@ -319,6 +327,11 @@ fun Modifier.calinoLongPressDrag(
                     if (!change.pressed) {
                         if (dragging) {
                             currentOnDragEnd?.invoke(totalDrag)
+                        } else if (menuPending) {
+                            // Held still past the menu delay and let go: the menu.
+                            currentOnDragCancel?.invoke()
+                            change.consume()
+                            currentOnLongPress?.invoke()
                         } else {
                             if (armed) currentOnDragCancel?.invoke()
                             // The release reaches us on Initial, before any
