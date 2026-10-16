@@ -1,5 +1,14 @@
 package calino.malinov.ski.ui.surfaces
 
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.LocalDensity
+import calino.malinov.ski.state.TaskInsertEdge
+import calino.malinov.ski.state.TaskReorderPlan
+import calino.malinov.ski.state.TaskTree
+import calino.malinov.ski.state.planDropReorder
 import calino.malinov.ski.R
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.res.pluralStringResource
@@ -162,6 +171,8 @@ fun AgendaScreen(
     onTaskClick: ((CalTask) -> Unit)? = null,
     onTaskAction: (TaskMenuAction, CalTask) -> Unit = { _, _ -> },
     onTaskDrop: (CalTask, LocalDate) -> Unit = { _, _ -> },
+    /** A drop on another task's edge in the same day: a new manual position. */
+    onTaskReorder: ((TaskReorderPlan) -> Unit)? = null,
     onTaskDone: (CalTask, Boolean) -> Unit = { _, _ -> },
     onAddOn: (LocalDate) -> Unit = {},
 ) {
@@ -369,6 +380,7 @@ fun AgendaScreen(
                 onTaskClick = onTaskClick,
                 onTaskAction = onTaskAction,
                 onTaskDrop = onTaskDrop,
+                onTaskReorder = onTaskReorder,
                 onTaskDone = onTaskDone,
                 onAddOn = onAddOn,
             )
@@ -389,7 +401,7 @@ fun AgendaScreen(
                         day = selected, events = selectedEvents, tasks = selectedTasks,
                         onEventClick = onEventClick, onEventAction = onEventAction, onEventDrop = onEventDrop,
                         onTaskClick = onTaskClick, onTaskAction = onTaskAction, onTaskDrop = onTaskDrop,
-                        onTaskDone = onTaskDone, onAdd = { onAddOn(selected) },
+                        onTaskReorder = onTaskReorder, onTaskDone = onTaskDone, onAdd = { onAddOn(selected) },
                     )
                 }
             }
@@ -421,6 +433,7 @@ private fun AgendaMonthPage(
     onTaskClick: ((CalTask) -> Unit)?,
     onTaskAction: (TaskMenuAction, CalTask) -> Unit,
     onTaskDrop: (CalTask, LocalDate) -> Unit,
+    onTaskReorder: ((TaskReorderPlan) -> Unit)?,
     onTaskDone: (CalTask, Boolean) -> Unit,
     onAddOn: (LocalDate) -> Unit,
 ) {
@@ -511,6 +524,7 @@ private fun AgendaMonthPage(
                 onTaskClick = onTaskClick,
                 onTaskAction = onTaskAction,
                 onTaskDrop = onTaskDrop,
+                onTaskReorder = onTaskReorder,
                 onTaskDone = onTaskDone,
                 onAdd = { onAddOn(day) },
             )
@@ -526,6 +540,12 @@ private const val AgendaFocusLineFromTop = .30f
  * the empty line. Shared by the month-paged agenda and by the landscape day
  * pane so the two cannot drift apart.
  */
+/** Share of a task row's height, at its top and bottom, that reads as "between rows" during a drag. */
+private const val AgendaReorderEdge = .25f
+
+/** What releasing a dragged agenda task would do; [plan] is set for a valid reorder. */
+private data class AgendaDropHit(val target: CalTask, val edge: TaskInsertEdge?, val plan: TaskReorderPlan?)
+
 @Composable
 internal fun AgendaDayBlock(
     day: LocalDate,
@@ -538,6 +558,7 @@ internal fun AgendaDayBlock(
     onTaskClick: ((CalTask) -> Unit)?,
     onTaskAction: (TaskMenuAction, CalTask) -> Unit,
     onTaskDrop: (CalTask, LocalDate) -> Unit,
+    onTaskReorder: ((TaskReorderPlan) -> Unit)?,
     onTaskDone: (CalTask, Boolean) -> Unit,
     onAdd: () -> Unit,
 ) {
@@ -580,7 +601,47 @@ internal fun AgendaDayBlock(
                     }
                 }
                 val taskLookup = LocalTaskLookup.current
-                nestWithinList(tasks, taskLookup).forEach { row ->
+                val listRows = nestWithinList(tasks, taskLookup)
+                val rowTasks = remember(listRows) { listRows.filterIsInstance<TaskListRow.Item>().map { it.task } }
+                val dayTree = remember(tasks) { TaskTree(tasks) }
+                // Where each task row is, read only while a drag recomposes.
+                val rowBounds = remember { mutableMapOf<String, Rect>() }
+                var draggingTaskId by remember { mutableStateOf<String?>(null) }
+                var dragY by remember { mutableFloatStateOf(0f) }
+                val gapSnapPx = with(LocalDensity.current) { 8.dp.toPx() }
+                // The dragged card's centre against the day's other task rows:
+                // the top or bottom quarter of one reorders (when valid); any
+                // other spot among them means "stay in this day".
+                val dropHit = remember(draggingTaskId, dragY, rowTasks) {
+                    // A host that does not handle reorders keeps the old drag.
+                    if (onTaskReorder == null) return@remember null
+                    val dragged = rowTasks.firstOrNull { it.id == draggingTaskId } ?: return@remember null
+                    val source = rowBounds[dragged.id] ?: return@remember null
+                    val center = source.center.y + dragY
+                    val (target, bounds) = rowTasks.asSequence()
+                        .filter { it.id != dragged.id }
+                        .mapNotNull { target -> rowBounds[target.id]?.let { target to it } }
+                        .map { (target, bounds) ->
+                            val distance = when {
+                                center < bounds.top -> bounds.top - center
+                                center > bounds.bottom -> center - bounds.bottom
+                                else -> 0f
+                            }
+                            Triple(target, bounds, distance)
+                        }
+                        .filter { it.third <= gapSnapPx }
+                        .minByOrNull { it.third }
+                        ?.let { it.first to it.second }
+                        ?: return@remember null
+                    val edge = when {
+                        center < bounds.top + bounds.height * AgendaReorderEdge -> TaskInsertEdge.Before
+                        center > bounds.bottom - bounds.height * AgendaReorderEdge -> TaskInsertEdge.After
+                        else -> null
+                    }
+                    AgendaDropHit(target, edge, edge?.let { planDropReorder(rowTasks, dragged, target.id, it, dayTree) })
+                }
+                val insertTarget = dropHit?.takeIf { it.plan != null }?.let { it.target.id to it.edge }
+                listRows.forEach { row ->
                     when (row) {
                         is TaskListRow.AbsentParent -> AbsentParentRow(
                             parent = row.parent,
@@ -590,7 +651,7 @@ internal fun AgendaDayBlock(
                         is TaskListRow.Item -> {
                             val (task, depth, nestingLines) = row
                             var menuOpen by remember(task.id) { mutableStateOf(false) }
-                            Box {
+                            Box(Modifier.onGloballyPositioned { rowBounds[task.id] = it.boundsInRoot() }) {
                                 AgendaTaskRow(
                                     task = task,
                                     // The rail has to cross this column's 6dp
@@ -608,11 +669,23 @@ internal fun AgendaDayBlock(
                                     onClick = onTaskClick?.let { click -> { click(task) } },
                                     onCheckedChange = { done -> onTaskDone(task, done) },
                                     onLongClick = { menuOpen = true },
+                                    onDragMove = { distance -> draggingTaskId = task.id; dragY = distance },
                                     onDragEnd = { offset ->
-                                        if (kotlin.math.abs(offset.y) > 36f) {
-                                            onTaskDrop(task, day.plusDays((offset.y / 76f).roundToInt().toLong()))
+                                        val hit = dropHit
+                                        when {
+                                            hit?.plan != null -> onTaskReorder?.invoke(hit.plan)
+                                            // Released among this day's tasks without a
+                                            // valid spot: it springs back rather than
+                                            // jumping to a neighbouring day.
+                                            hit != null -> Unit
+                                            kotlin.math.abs(offset.y) > 36f ->
+                                                onTaskDrop(task, day.plusDays((offset.y / 76f).roundToInt().toLong()))
                                         }
+                                        draggingTaskId = null
+                                        dragY = 0f
                                     },
+                                    onDragCancel = { draggingTaskId = null; dragY = 0f },
+                                    insertEdge = insertTarget?.takeIf { it.first == task.id }?.second,
                                 )
                                 TaskActionMenu(
                                     task = task,
@@ -648,6 +721,8 @@ fun DayPane(
     onTaskClick: ((CalTask) -> Unit)? = null,
     onTaskAction: (TaskMenuAction, CalTask) -> Unit = { _, _ -> },
     onTaskDrop: (CalTask, LocalDate) -> Unit = { _, _ -> },
+    /** A drop on another task's edge in the same day: a new manual position. */
+    onTaskReorder: ((TaskReorderPlan) -> Unit)? = null,
     onTaskDone: (CalTask, Boolean) -> Unit = { _, _ -> },
     onAdd: (LocalDate) -> Unit = {},
 ) {
@@ -686,6 +761,7 @@ fun DayPane(
                 onTaskClick = onTaskClick,
                 onTaskAction = onTaskAction,
                 onTaskDrop = onTaskDrop,
+                onTaskReorder = onTaskReorder,
                 onTaskDone = onTaskDone,
                 onAdd = { onAdd(pageDay) },
             )

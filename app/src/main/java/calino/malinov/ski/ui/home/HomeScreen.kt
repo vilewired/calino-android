@@ -62,6 +62,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.platform.LocalContext
+import calino.malinov.ski.state.TaskReorderPlan
 import calino.malinov.ski.R
 import calino.malinov.ski.util.localizedDateFormatter
 import calino.malinov.ski.util.LocalCalinoLocale
@@ -601,6 +602,8 @@ fun HomeScreen(
     onTaskClick: ((CalTask) -> Unit)? = null,
     onTaskAction: (TaskMenuAction, CalTask) -> Unit = { _, _ -> },
     onTaskDrop: (CalTask, LocalDate) -> Unit = { _, _ -> },
+    /** A drop between two tasks of a day in the day pane: a new manual position. */
+    onTaskReorder: ((TaskReorderPlan) -> Unit)? = null,
     onOpenDay: ((LocalDate) -> Unit)? = null,
     interactionEnabled: Boolean = true,
     /**
@@ -1655,6 +1658,7 @@ fun HomeScreen(
             onTaskClick = onTaskClick,
             onTaskAction = onTaskAction,
             onTaskDrop = onTaskDrop,
+            onTaskReorder = onTaskReorder,
             onTaskDone = onTaskDone,
             onAddOn = { date -> onOpenDay?.invoke(date) },
         )
@@ -2334,6 +2338,7 @@ private fun SplitHomeLayout(
     onTaskClick: ((CalTask) -> Unit)?,
     onTaskAction: (TaskMenuAction, CalTask) -> Unit,
     onTaskDrop: (CalTask, LocalDate) -> Unit,
+    onTaskReorder: ((TaskReorderPlan) -> Unit)? = null,
     onTaskDone: (CalTask, Boolean) -> Unit,
     onAddOn: (LocalDate) -> Unit,
 ) {
@@ -2440,6 +2445,7 @@ private fun SplitHomeLayout(
                 onTaskClick = onTaskClick,
                 onTaskAction = onTaskAction,
                 onTaskDrop = onTaskDrop,
+                onTaskReorder = onTaskReorder,
                 onTaskDone = onTaskDone,
                 onAdd = onAddOn,
             )

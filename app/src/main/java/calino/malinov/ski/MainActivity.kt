@@ -2285,6 +2285,9 @@ private fun CalinoAppContent(pocViewModel: PocRepositoryViewModel) {
                         onTaskDrop = { task, date ->
                             launchWrite({ repository.rescheduleTask(task.id, date) }) { showUndo(it) }
                         },
+                        onTaskReorder = { plan ->
+                            launchWrite({ repository.applyTaskReorder(plan) }, indicate = PillWriteKind.Save)
+                        },
                         onTaskDone = { task, done ->
                             setTaskDone(task, done)
                         },
@@ -2426,6 +2429,9 @@ private fun CalinoAppContent(pocViewModel: PocRepositoryViewModel) {
                         onEventDrop = ::handleEventDrop,
                         onTaskDrop = { task, date ->
                             launchWrite({ repository.rescheduleTask(task.id, date) }) { showUndo(it) }
+                        },
+                        onTaskReorder = { plan ->
+                            launchWrite({ repository.applyTaskReorder(plan) }, indicate = PillWriteKind.Save)
                         },
                         onTaskClick = { task ->
                             openTaskDetail(task, PocReturnTarget.Agenda)
@@ -2875,6 +2881,9 @@ private fun CalinoAppContent(pocViewModel: PocRepositoryViewModel) {
                         onTaskAction = ::handleTaskAction,
                         onTaskDrop = { task, date ->
                             launchWrite({ repository.rescheduleTask(task.id, date) }) { showUndo(it) }
+                        },
+                        onTaskReorder = { plan ->
+                            launchWrite({ repository.applyTaskReorder(plan) }, indicate = PillWriteKind.Save)
                         },
                         onTaskDone = { task, done -> setTaskDone(task, done) },
                         onAdd = { day ->
