@@ -231,5 +231,12 @@ fun nestWithinList(
  */
 val LocalTaskLookup = staticCompositionLocalOf<(String) -> CalTask?> { { null } }
 
+/**
+ * Whether a task's menu can offer Move up (-1) or Move down (+1): the host
+ * answers from every task it shows, which no single surface holds. The default
+ * offers neither, which is what a preview or a test gets.
+ */
+val LocalTaskReorderStep = staticCompositionLocalOf<(CalTask, Int) -> Boolean> { { _, _ -> false } }
+
 /** Opens an event's attachment: a link in its app, inline data through a cached file. */
 val LocalAttachmentOpener = staticCompositionLocalOf<(calino.malinov.ski.data.model.CalEvent, calino.malinov.ski.data.model.EventAttachment) -> Unit> { { _, _ -> } }

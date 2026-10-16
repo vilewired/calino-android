@@ -1,5 +1,6 @@
 package calino.malinov.ski.ui.surfaces
 
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.vector.ImageVector
 import calino.malinov.ski.ui.components.CalinoActionMenu
 import calino.malinov.ski.ui.components.CalinoActionMenuDivider
@@ -123,6 +124,7 @@ import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.graphicsLayer
@@ -191,6 +193,10 @@ import calino.malinov.ski.state.LocalCalinoNow
 import calino.malinov.ski.state.LocalCalinoPreferences
 import calino.malinov.ski.state.LocalTimeFormat
 import calino.malinov.ski.state.TaskTree
+import calino.malinov.ski.state.LocalTaskReorderStep
+import calino.malinov.ski.state.TaskInsertEdge
+import calino.malinov.ski.state.TaskReorderPlan
+import calino.malinov.ski.state.planDropReorder
 import calino.malinov.ski.state.orderTasksByDue
 import calino.malinov.ski.ui.components.taskNestIndent
 import calino.malinov.ski.ui.components.rememberDatePicker
@@ -280,12 +286,20 @@ sealed interface PockRoute {
 enum class QuickAddKind { Event, Task, Journal }
 enum class TaskFilter { All, Active, Completed }
 
+/** Share of a task row's height, at its top and bottom, that reads as "between rows" during a drag. */
+private const val ReorderEdge = .25f
+
+/** What the dragged task would do on release: nest under [target], or (with [edge]) take the [plan]'s position. */
+private data class TaskDropHit(val target: CalTask, val edge: TaskInsertEdge?, val plan: TaskReorderPlan?)
+
 enum class TaskMenuAction {
     Schedule,
     ThisWeek,
     Edit,
     AddSubtask,
     Promote,
+    MoveUp,
+    MoveDown,
     Today,
     Tomorrow,
     NextWeek,
@@ -335,6 +349,10 @@ fun TaskActionMenu(
         action(TaskMenuAction.NextWeek, stringResource(R.string.ed_menu_move_next_week), CalinoIcons.CalendarRange, !task.done)
         if (!hasSubtasks) action(TaskMenuAction.AddSubtask, stringResource(R.string.ed_task_add_subtask), CalinoIcons.Plus)
         if (task.parentTaskId != null) action(TaskMenuAction.Promote, stringResource(R.string.ed_menu_move_top_level), CalinoIcons.AgendaList)
+        // Offered only where the step exists in the task's day list.
+        val canStep = LocalTaskReorderStep.current
+        if (canStep(task, -1)) action(TaskMenuAction.MoveUp, stringResource(R.string.ed_menu_move_up), CalinoIcons.ArrowUp)
+        if (canStep(task, 1)) action(TaskMenuAction.MoveDown, stringResource(R.string.ed_menu_move_down), CalinoIcons.ArrowDown)
         action(TaskMenuAction.ConvertToEvent, stringResource(R.string.ed_menu_convert_event), CalinoIcons.Clock, task.due != null)
         CalinoActionMenuDivider()
         CalinoActionMenuItem(stringResource(R.string.ed_menu_delete), icon = CalinoIcons.Trash, danger = true, description = stringResource(R.string.ed_task_delete)) { run(TaskMenuAction.Delete) }
@@ -2624,6 +2642,8 @@ fun TasksSurface(
     onTaskAction: (TaskMenuAction, CalTask) -> Unit = { _, _ -> },
     onTaskDrop: (CalTask, CalTask?) -> Unit = { _, _ -> },
     onReopen: (CalTask) -> Unit = {},
+    /** A drop on a row's top or bottom edge: a new manual position, not a nest. */
+    onTaskReorder: (TaskReorderPlan) -> Unit = {},
 ) {
     val context = LocalContext.current
     val shortTaskDateFormat = localizedDateFormatter("MMM d")
@@ -2778,25 +2798,44 @@ fun TasksSurface(
             })
         }
     }
-    val dropTarget = remember(dragOrder, draggingTaskId, dragDistanceY) {
-        val fromIndex = dragOrder.indexOfFirst { it.id == draggingTaskId }
-        val dragged = dragOrder.getOrNull(fromIndex)
+    // Where the dragged row's centre is: the top or bottom quarter of another
+    // row reorders (when that is a valid move), the middle nests. A centre in
+    // the gap between two rows counts as the nearer row's edge.
+    val gapSnapPx = with(LocalDensity.current) { 8.dp.toPx() }
+    val dropHit = remember(dragOrder, draggingTaskId, dragDistanceY) {
+        val dragged = dragOrder.firstOrNull { it.id == draggingTaskId }
         val sourceBounds = dragged?.let { taskDropBounds[it.id] }
-        if (fromIndex < 0 || dragged == null || sourceBounds == null) {
-            null
-        } else {
-            val draggedCenter = (sourceBounds.top + sourceBounds.bottom) / 2f + dragDistanceY
-            dragOrder.firstOrNull { target ->
-                val targetBounds = taskDropBounds[target.id]
-                targetBounds != null && draggedCenter >= targetBounds.top &&
-                    draggedCenter <= targetBounds.bottom
-            }?.takeIf { target ->
-                target.id != dragged.id &&
-                    target.parentTaskId != dragged.id &&
-                    taskTree.canAdopt(dragged.id, target.id)
+        if (dragged == null || sourceBounds == null) return@remember null
+        val draggedCenter = (sourceBounds.top + sourceBounds.bottom) / 2f + dragDistanceY
+        val (target, bounds) = dragOrder.asSequence()
+            .filter { it.id != dragged.id }
+            .mapNotNull { target -> taskDropBounds[target.id]?.let { target to it } }
+            .map { (target, bounds) ->
+                val distance = when {
+                    draggedCenter < bounds.top -> bounds.top - draggedCenter
+                    draggedCenter > bounds.bottom -> draggedCenter - bounds.bottom
+                    else -> 0f
+                }
+                Triple(target, bounds, distance)
             }
+            .filter { it.third <= gapSnapPx }
+            .minByOrNull { it.third }
+            ?.let { it.first to it.second }
+            ?: return@remember null
+        val height = bounds.bottom - bounds.top
+        val edge = when {
+            draggedCenter < bounds.top + height * ReorderEdge -> TaskInsertEdge.Before
+            draggedCenter > bounds.bottom - height * ReorderEdge -> TaskInsertEdge.After
+            else -> null
+        }
+        edge?.let { planDropReorder(dragOrder, dragged, target.id, it, taskTree) }
+            ?.let { plan -> return@remember TaskDropHit(target, edge, plan) }
+        TaskDropHit(target, null, null).takeIf {
+            target.parentTaskId != dragged.id && taskTree.canAdopt(dragged.id, target.id)
         }
     }
+    val dropTarget = dropHit?.takeIf { it.plan == null }?.target
+    val insertTarget = dropHit?.let { hit -> hit.edge?.let { hit.target.id to it } }
     // Dragging a subtask clear of its indent is the inverse of dropping one row
     // onto another: it lets go of the parent without going through the menu.
     val unnestThresholdPx = with(LocalDensity.current) { 56.dp.toPx() }
@@ -2813,7 +2852,10 @@ fun TasksSurface(
         // menu. A drag that misses a valid task (including a cycle-forming
         // descendant) should simply spring back instead of unexpectedly
         // promoting the source task.
-        if (dragged != null && dropTarget != null) {
+        val reorder = dropHit?.plan
+        if (dragged != null && reorder != null) {
+            onTaskReorder(reorder)
+        } else if (dragged != null && dropTarget != null) {
             onTaskDrop(dragged, dropTarget)
         } else if (dragged != null && unnestingTaskId == dragged.id) {
             onTaskDrop(dragged, null)
@@ -2909,6 +2951,7 @@ fun TasksSurface(
                                 peekedTaskIds = peekedTaskIds,
                                 outsideChildren = ::outsideChildren,
                                 onCompleteAny = ::complete,
+                                insertTarget = insertTarget,
                             )
                         }
                         LazyColumn(
@@ -3028,6 +3071,8 @@ private fun LazyListScope.TaskBucket(
     outsideChildren: (CalTask) -> List<CalTask> = { emptyList() },
     /** Completes an open subtask shown here under a parent of another section. */
     onCompleteAny: (CalTask) -> Unit = onComplete,
+    /** The row a drag would insert next to, and on which side. */
+    insertTarget: Pair<String, TaskInsertEdge>? = null,
 ) {
     if (tasks.isNotEmpty()) {
         val ordered = orderTasksByDue(tasks)
@@ -3105,6 +3150,7 @@ private fun LazyListScope.TaskBucket(
                     onToggleSubtasks = { onToggleSubtasks(task) },
                     onTaskAction = onTaskAction,
                     isDropTarget = dropTarget?.id == task.id,
+                    insertEdge = if (peek) null else insertTarget?.takeIf { it.first == task.id }?.second,
                     isUnnesting = unnestingTaskId == task.id,
                     // A peeked copy is not a drop target or a drag source: its
                     // real row, in its own section, owns those.
@@ -3184,6 +3230,8 @@ private fun TaskRow(
     onToggleSubtasks: () -> Unit = {},
     onTaskAction: (TaskMenuAction, CalTask) -> Unit = { _, _ -> },
     isDropTarget: Boolean = false,
+    /** A drag would put its task just above or below this row. */
+    insertEdge: TaskInsertEdge? = null,
     isUnnesting: Boolean = false,
     onDragStart: (() -> Unit)? = null,
     onDrag: ((Offset) -> Unit)? = null,
@@ -3239,6 +3287,16 @@ private fun TaskRow(
         label = "task drop border",
     )
     val hairline = CalinoColors.Ink.copy(.06f)
+    // The insertion line fades in and out; the side it was last drawn on is
+    // kept so the fade-out does not jump to the other edge.
+    var lastInsertEdge by remember(task.id) { mutableStateOf(insertEdge) }
+    LaunchedEffect(insertEdge) { if (insertEdge != null) lastInsertEdge = insertEdge }
+    val insertAlpha by animateFloatAsState(
+        targetValue = if (insertEdge != null) 1f else 0f,
+        animationSpec = tween(100),
+        label = "task insert line",
+    )
+    val insertColor = CalinoColors.Accent
     val drawsDivider = groupPosition == TaskGroupPosition.First || groupPosition == TaskGroupPosition.Middle
     val canAct = !task.done
     val chevronRotation by animateFloatAsState(
@@ -3342,6 +3400,22 @@ private fun TaskRow(
                         } else Modifier,
                     )
                     .border(BorderStroke(if (isDropTarget) 2.dp else 1.dp, rowBorder), rowShape)
+                    .drawWithContent {
+                        drawContent()
+                        val edge = lastInsertEdge
+                        if (insertAlpha > 0f && edge != null) {
+                            val stroke = 3.dp.toPx()
+                            val y = if (edge == TaskInsertEdge.Before) stroke / 2f else size.height - stroke / 2f
+                            val inset = 12.dp.toPx()
+                            drawLine(
+                                insertColor.copy(alpha = insertAlpha),
+                                Offset(inset, y),
+                                Offset(size.width - inset, y),
+                                stroke,
+                                cap = StrokeCap.Round,
+                            )
+                        }
+                    }
                     .semantics { contentDescription = description }
                     .pointerInput(task.id, canAct) {
                         if (canAct) detectHorizontalDragGestures(
@@ -3941,7 +4015,8 @@ fun Tasks(
     onTaskAction: (TaskMenuAction, CalTask) -> Unit = { _, _ -> },
     onTaskDrop: (CalTask, CalTask?) -> Unit = { _, _ -> },
     onReopen: (CalTask) -> Unit = {},
-) = TasksSurface(tasks, onComplete, onReschedule, onRescheduleTo, onTaskClick, onOpenMenu, onTaskAction, onTaskDrop, onReopen)
+    onTaskReorder: (TaskReorderPlan) -> Unit = {},
+) = TasksSurface(tasks, onComplete, onReschedule, onRescheduleTo, onTaskClick, onOpenMenu, onTaskAction, onTaskDrop, onReopen, onTaskReorder)
 
 /** Shared animated Event/Task/Journal editor sheet. */
 @Composable

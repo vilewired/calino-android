@@ -563,6 +563,8 @@
     <string name="ed_menu_move_today">Move to today</string>
     <string name="ed_menu_move_tomorrow">Move to tomorrow</string>
     <string name="ed_menu_move_top_level">Move to top level</string>
+    <string name="ed_menu_move_up">Move up</string>
+    <string name="ed_menu_move_down">Move down</string>
     <string name="ed_menu_reopen">Reopen</string>
     <string name="ed_menu_schedule">Schedule</string>
     <string name="ed_menu_share">Share</string>

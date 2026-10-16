@@ -6,6 +6,8 @@ import calino.malinov.ski.data.model.NewEvent
 import calino.malinov.ski.data.model.NewTask
 import calino.malinov.ski.data.model.RecurrenceEditScope
 import calino.malinov.ski.data.model.placementDate
+import calino.malinov.ski.state.TaskReorderPlan
+import calino.malinov.ski.state.isRecurringTask
 import java.time.LocalDateTime
 
 /** Standards-safe recurring VTODO eligibility shared by both repositories. */
@@ -61,6 +63,39 @@ fun CalTask.asUpdate(parentTaskId: String? = this.parentTaskId, due: java.time.L
         recurrenceChanged = recurrenceChanged,
         recurrenceScope = recurrenceScope,
     )
+
+/**
+ * Writes a reorder, one ordinary conditional update per changed task. A
+ * repeating task's value goes on its master: the occurrence row is updated
+ * with the series scope, the same path as editing "all occurrences", which
+ * keeps the master's own dates and status. Stops at the first rejection.
+ */
+suspend fun CalinoRepository.applyTaskReorder(plan: TaskReorderPlan): WriteResult<Unit> {
+    val reparent = plan.reparent
+    val updates = LinkedHashMap<String, NewTask>()
+    for (write in plan.writes) {
+        val task = write.task
+        val scope = if (task.isRecurringTask()) RecurrenceEditScope.All else task.recurrenceScope
+        updates[task.id] = task.asUpdate().copy(sortOrder = write.sortOrder, recurrenceScope = scope)
+    }
+    if (reparent != null) {
+        val (task, parentId) = reparent
+        if (TaskTreeValidation.wouldCycle(tasks(), task.id, parentId)) {
+            return WriteResult.Rejected(WriteRejectionCode.TASK_CANNOT_CONTAIN_ITSELF)
+        }
+        updates[task.id] = (updates[task.id] ?: task.asUpdate()).copy(parentTaskId = parentId)
+    }
+    var queued = false
+    for ((id, input) in updates) {
+        val done = tasks().firstOrNull { it.id == id }?.done ?: false
+        when (val result = updateTask(id, input, done)) {
+            is WriteResult.Applied -> Unit
+            is WriteResult.Queued -> queued = true
+            is WriteResult.Rejected -> return result
+        }
+    }
+    return if (queued) WriteResult.Queued(Unit) else WriteResult.Applied(Unit)
+}
 
 suspend fun CalinoRepository.reparentTask(task: CalTask, parentTaskId: String?): WriteResult<CalTask> {
     if (TaskTreeValidation.wouldCycle(tasks(), task.id, parentTaskId)) {

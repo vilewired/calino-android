@@ -6,7 +6,14 @@ import calino.malinov.ski.data.caldav.ICalWriter
 import calino.malinov.ski.data.model.CalTask
 import calino.malinov.ski.data.model.NewTask
 import calino.malinov.ski.state.SortOrderStep
+import calino.malinov.ski.state.SortOrderWrite
+import calino.malinov.ski.state.TaskInsertEdge
 import calino.malinov.ski.state.TaskTree
+import calino.malinov.ski.state.dayReorderGroup
+import calino.malinov.ski.state.planDropReorder
+import calino.malinov.ski.state.planReorder
+import calino.malinov.ski.state.planStep
+import calino.malinov.ski.state.stepIndex
 import calino.malinov.ski.state.nextSubtaskSortOrder
 import calino.malinov.ski.state.orderTasksByDue
 import calino.malinov.ski.state.tasksDueOn
@@ -226,5 +233,115 @@ class TaskSortOrderTest {
         assertNull(nextSubtaskSortOrder(emptyList()))
         assertNull(NewTask(title = "new", parentTaskId = "p").withNewSubtaskOrder(listOf(task("a", parent = "p"))).sortOrder)
         assertNull(NewTask(title = "top").withNewSubtaskOrder(listOf(task("a", sortOrder = 5))).sortOrder)
+    }
+
+    // Reordering (same cases as the web app's taskReorder.test.ts)
+
+    private fun ordered(vararg pairs: Pair<String, Long?>) = pairs.map { (id, value) -> task(id, sortOrder = value) }
+
+    private fun List<SortOrderWrite>.values() = map { it.task.id to it.sortOrder }
+
+    @Test
+    fun `takes the midpoint between its new neighbours`() {
+        val group = ordered("a" to 1000L, "b" to 2000L, "c" to 3000L)
+        assertEquals(listOf("c" to 1500L), planReorder(group, group[2], 1).values())
+    }
+
+    @Test
+    fun `goes after the last ordered task when the next has no value`() {
+        val group = ordered("a" to 813528420L, "b" to null, "c" to null)
+        assertEquals(listOf("c" to 813528420L + SortOrderStep), planReorder(group, group[2], 1).values())
+    }
+
+    @Test
+    fun `goes before the first task when dropped at the top`() {
+        val group = ordered("a" to 1000L, "b" to 2000L)
+        assertEquals(listOf("b" to 0L), planReorder(group, group[1], 0).values())
+    }
+
+    @Test
+    fun `seeds the unordered tasks above the drop point in their current order`() {
+        val group = ordered("a" to null, "b" to null, "c" to null, "d" to null)
+        assertEquals(listOf("a" to 1000L, "d" to 2000L), planReorder(group, group[3], 1).values())
+        val partly = ordered("a" to 50L, "b" to null, "c" to null)
+        assertEquals(listOf("b" to 1050L, "c" to 2050L), planReorder(partly, partly[2], 2).values())
+    }
+
+    @Test
+    fun `renumbers the ordered part when there is no gap, keeping its first value`() {
+        val group = ordered("a" to 1L, "b" to 2L, "c" to 3L, "d" to null)
+        assertEquals(listOf("c" to 1001L, "b" to 2001L), planReorder(group, group[2], 1).values())
+    }
+
+    @Test
+    fun `writes nothing when the task lands where it was`() {
+        val group = ordered("a" to 1000L, "b" to 1500L, "c" to 2000L)
+        assertEquals(emptyList<Pair<String, Long>>(), planReorder(group, group[1], 1).values())
+    }
+
+    @Test
+    fun `steps one place and stops at the ends`() {
+        val group = ordered("a" to 1L, "b" to 2L, "c" to 3L)
+        assertEquals(listOf("b" to 1L - SortOrderStep), planReorder(group, group[1], stepIndex(group, group[1], -1)!!).values())
+        assertEquals(listOf("b" to 3L + SortOrderStep), planReorder(group, group[1], stepIndex(group, group[1], 1)!!).values())
+        assertNull(stepIndex(group, group[0], -1))
+        assertNull(stepIndex(group, group[2], 1))
+    }
+
+    @Test
+    fun `menu steps go through open untimed tasks of the same day and parent`() {
+        val tasks = listOf(
+            task("a", sortOrder = 1000),
+            task("b", sortOrder = 2000),
+            task("done", sortOrder = 1500).copy(done = true),
+            task("timed", sortOrder = 1, time = LocalTime.of(9, 0)),
+            task("sub", parent = "a"),
+            task("tomorrow", due = day.plusDays(1)),
+        )
+        assertEquals(listOf("a", "b"), dayReorderGroup(tasks, tasks[1]).map { it.id })
+        assertEquals(listOf("b" to 0L), planStep(tasks, tasks[1], -1)!!.writes.values())
+        assertNull(planStep(tasks, tasks[1], 1))
+        assertNull(planStep(tasks, tasks[3], -1))
+    }
+
+    @Test
+    fun `a repeating task moves as one series`() {
+        val series = task("gym@2026-03-03", sortOrder = 5000).copy(uid = "gym", recurrence = "FREQ=DAILY", recurrenceDate = day)
+        val tasks = listOf(task("a", sortOrder = 1000), series)
+        val plan = planStep(tasks, series, -1)!!
+        assertEquals(listOf("gym@2026-03-03" to 0L), plan.writes.values())
+    }
+
+    @Test
+    fun `an edge drop reorders, and below an expanded parent it becomes the first subtask`() {
+        val a = task("a", sortOrder = 1000)
+        val b = task("b", sortOrder = 2000)
+        val c = task("c", sortOrder = 3000)
+        val rows = listOf(a, b, c)
+        assertEquals(listOf("c" to 1500L), planDropReorder(rows, c, "b", TaskInsertEdge.Before, TaskTree(rows))!!.writes.values())
+
+        val parent = task("p")
+        val child = task("kid", sortOrder = 10, parent = "p")
+        val list = listOf(parent, child, a)
+        val plan = planDropReorder(list, a, "p", TaskInsertEdge.After, TaskTree(list))!!
+        assertEquals(listOf("a" to 10L - SortOrderStep), plan.writes.values())
+        assertEquals("p", plan.reparent?.second)
+    }
+
+    @Test
+    fun `an edge drop refuses other days, timed tasks, cycles and re-parenting a series`() {
+        val a = task("a", sortOrder = 1000)
+        val tomorrow = task("t", due = day.plusDays(1))
+        val timed = task("timed", time = LocalTime.of(9, 0))
+        val rows = listOf(a, tomorrow, timed)
+        assertNull(planDropReorder(rows, tomorrow, "a", TaskInsertEdge.Before, TaskTree(rows)))
+        assertNull(planDropReorder(rows, a, "timed", TaskInsertEdge.Before, TaskTree(rows)))
+
+        val parent = task("p")
+        val child = task("kid", parent = "p")
+        val series = task("s").copy(uid = "s", recurrence = "FREQ=DAILY")
+        val list = listOf(parent, child, series)
+        assertNull(planDropReorder(list, parent, "kid", TaskInsertEdge.Before, TaskTree(list)))
+        assertNull(planDropReorder(list, series, "kid", TaskInsertEdge.Before, TaskTree(list)))
     }
 }

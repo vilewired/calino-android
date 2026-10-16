@@ -234,6 +234,9 @@ import calino.malinov.ski.design.CalinoTheme
 import calino.malinov.ski.design.CalinoThemes
 import calino.malinov.ski.util.CalinoThemeChoice
 import calino.malinov.ski.state.LocalTaskLookup
+import calino.malinov.ski.state.LocalTaskReorderStep
+import calino.malinov.ski.state.planStep
+import calino.malinov.ski.data.repository.applyTaskReorder
 import calino.malinov.ski.state.FixtureNow
 import calino.malinov.ski.state.CalinoFoldPosture
 import calino.malinov.ski.state.LocalFoldPosture
@@ -1795,6 +1798,9 @@ private fun CalinoAppContent(pocViewModel: PocRepositoryViewModel) {
                 date = task.due,
             )
             TaskMenuAction.Promote -> launchWrite({ repository.reparentTask(task, null) })
+            TaskMenuAction.MoveUp, TaskMenuAction.MoveDown ->
+                planStep(calendarTasks, task, if (action == TaskMenuAction.MoveUp) -1 else 1)
+                    ?.let { plan -> launchWrite({ repository.applyTaskReorder(plan) }) }
             TaskMenuAction.Today -> launchWrite({ repository.rescheduleTask(task.id, now.today) }) { showUndo(it) }
             TaskMenuAction.Tomorrow -> launchWrite({ repository.rescheduleTask(task.id, now.today.plusDays(1)) }) { showUndo(it) }
             TaskMenuAction.NextWeek -> launchWrite({ repository.rescheduleTask(task.id, now.today.plusDays(7)) }) { showUndo(it) }
@@ -2155,9 +2161,13 @@ private fun CalinoAppContent(pocViewModel: PocRepositoryViewModel) {
         val byId = calendarTasks.associateBy { it.id }
         ({ id: String -> byId[id] })
     }
+    val taskReorderStep: (CalTask, Int) -> Boolean = remember(calendarTasks) {
+        { task: CalTask, direction: Int -> planStep(calendarTasks, task, direction) != null }
+    }
     CompositionLocalProvider(
         LocalCalinoSync provides syncStatus,
         LocalTaskLookup provides taskLookup,
+        LocalTaskReorderStep provides taskReorderStep,
         calino.malinov.ski.state.LocalAttachmentOpener provides ::openAttachment,
     ) {
     // Keep the blur on the calendar/content sibling only. AI surfaces are
@@ -2448,6 +2458,9 @@ private fun CalinoAppContent(pocViewModel: PocRepositoryViewModel) {
                         onTaskAction = ::handleTaskAction,
                         onTaskDrop = { task, target ->
                             launchWrite({ repository.reparentTask(task, target?.id) }, indicate = PillWriteKind.Save)
+                        },
+                        onTaskReorder = { plan ->
+                            launchWrite({ repository.applyTaskReorder(plan) }, indicate = PillWriteKind.Save)
                         },
                     )
                     PockRoute.Journal -> JournalSurface(
